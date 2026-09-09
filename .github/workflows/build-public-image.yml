@@ -13,6 +13,7 @@ env:
   IMAGE: ghcr.io/j34ni/g4e-notebook
 jobs:
   build-and-push:
+    if: github.repository == 'j34ni/g4e-desp-argo'
     runs-on: ubuntu-latest
     permissions:
       contents: read
