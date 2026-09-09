@@ -1,6 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cu126
 torch
-healpix-geo @ git+https://github.com/GRID4EARTH/healpix-geo.git@76594745ee779c1306112ac25d1e176f36b6df98#subdirectory=healpix-geo-python
+healpix-geo==0.4.0
 git+https://github.com/GRID4EARTH/healpix-plot.git@42a6d04abed7ed0634f978f43b05a5e9f6acefe5
 git+https://github.com/GRID4EARTH/healpix-resample.git@612c6bd9fcf3a5d64c49471c07985e64e1615bd1
 xdggs
