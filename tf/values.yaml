@@ -33,7 +33,7 @@ hub:
     02-profile-list: |
       async def profile_list(spawner):
           username = spawner.user.name
-          s2msi_users = ['pablo-richard', 'capetienne', 'cgueguen', 'j34ni', 'annefou', 'tinaok']
+          s2msi_users = ['pablo-richard', 'capetienne', 'cgueguen', 'j34ni', 'annefou', 'tinaok', 'jmdelouis']
           s3syn_users = ['j34ni', 'annefou', 'tinaok', 'tik65536']
 
           standard_profile = {
