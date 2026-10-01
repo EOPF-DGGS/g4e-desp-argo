@@ -1,0 +1,149 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: legacy-converters-sentinel-3
+  namespace: argo
+spec:
+  entrypoint: convert-sentinel-3
+  serviceAccountName: argo-workflow
+  imagePullSecrets:
+    - name: harbor-pull-secret
+  arguments:
+    parameters:
+      - name: collection
+        value: sentinel-3-olci-l1-efr
+      - name: item_id
+        value: ""
+      - name: resampler
+        value: psf
+      - name: large_parent_chunk
+        value: "false"
+      - name: nworkers
+        value: "4"
+      - name: s3_path
+        value: s3://g4e-desp-argo-artifacts/
+      - name: s3_endpoint
+        value: https://s3.gra.io.cloud.ovh.net
+  volumes:
+    - name: s3-creds
+      secret:
+        secretName: argo-s3-credentials
+  templates:
+  - name: convert-sentinel-3
+    inputs:
+      parameters:
+        - name: collection
+        - name: item_id
+        - name: resampler
+        - name: large_parent_chunk
+        - name: nworkers
+        - name: s3_path
+        - name: s3_endpoint
+    outputs: {}
+    metadata: {}
+    script:
+      name: ""
+      image: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-01
+      command:
+        - python
+      resources:
+        limits:
+          cpu: "4"
+          memory: 16Gi
+        requests:
+          cpu: "4"
+          memory: 16Gi
+      volumeMounts:
+        - name: s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+      source: |
+        import dask
+        import healpix_geo
+        import numpy as np
+        import pystac_client
+        import shapely
+        import xarray as xr
+        import torch
+        from dask.distributed import LocalCluster
+        from legacy_converters import (
+            ConvertSettings,
+            convert_group_to_healpix,
+            create_staging_cache,
+            get_settings,
+            prepare_healpix_dataset,
+            create_healpix_dataset
+        )
+
+        _HEALPIX_L4 = {
+            "refinement_level": 4,
+            "indexing_scheme": "nested",
+            "ellipsoid": {"name": "wgs84"},
+        }
+        output_path = "{instrument}/{collection_name}/{item_name}_{resampler}.zarr"
+
+        collection = "{{inputs.parameters.collection}}"
+        item_id = "{{inputs.parameters.item_id}}"
+        resampler = "{{inputs.parameters.resampler}}"
+        use_large_parent_chunk = "{{inputs.parameters.large_parent_chunk}}"
+        nworkers = "{{inputs.parameters.nworkers}}"
+        s3_path = "{{inputs.parameters.s3_path}}"
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        nworkers = int(nworkers)
+        use_large_parent_chunk = False if (use_large_parent_chunk.lower() == "false") else True
+        resampler = resampler.lower()
+        use_gpu = torch.cuda.is_available()
+        instrument = collection.split("-")[2]
+
+        if s3_path.startswith("s3://"):
+            with open("/etc/s3/accessKey") as f:
+                s3_key = f.read().strip()
+            with open("/etc/s3/secretKey") as f:
+                s3_secret = f.read().strip()
+            output_storage_options = {
+                "key": s3_key,
+                "secret": s3_secret,
+                "client_kwargs": {"endpoint_url": s3_endpoint},
+            }
+        else:
+            output_storage_options = None
+
+        catalog = pystac_client.Client.open("https://stac.core.eopf.eodc.eu")
+        if item_id == "":
+            items = catalog.get_collection(collection).get_items()
+            output_path = output_path.format(instrument=instrument, collection_name=collection,
+                                             item_name=item_id, resampler=resampler)
+            output_path = s3_path + output_path
+        else:
+            items = [catalog.get_collection(collection).get_item(item_id)]
+            output_path = s3_path
+
+        input_paths = [item.assets["product"].href for item in items]
+
+        if resampler == "psf":
+            settings = get_settings(collection + f"-{resampler}")
+            settings = settings.to_dict()
+            for group_name in list(settings['group_settings'].keys()):
+                if use_gpu:
+                    settings['group_settings'][group_name]['resampler']['init_params'].update({'device': 'cuda'})
+                if use_large_parent_chunk:
+                    settings['group_settings'][group_name]['chunk']['healpix'].update(_HEALPIX_L4)
+            settings = ConvertSettings.model_validate(settings)
+        else:
+            settings = get_settings(collection)
+
+        if __name__ == "__main__":
+            if nworkers > 1:
+                with dask.config.set({"processes": 1}):
+                    cluster = LocalCluster(n_workers=nworkers)
+                    client = cluster.get_client()
+
+            group_names = [f'/{grp_name}' for grp_name in settings.group_settings.keys()]
+
+            result = create_healpix_dataset(input_paths, settings=settings,
+                                            groups=group_names,
+                                            output_path=output_path,
+                                            output_storage_options=output_storage_options)
+
+            print("Done:", result)
