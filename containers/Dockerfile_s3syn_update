@@ -1,0 +1,5 @@
+FROM y74y55mn.gra7.container-registry.ovh.net/healpix-private/s3syn:latest
+
+RUN /opt/conda/bin/pip list --format=freeze > /tmp/constraints.txt && \
+    /opt/conda/bin/pip install --no-cache-dir -c /tmp/constraints.txt pystac-client==0.9.0 && \
+    rm -f /tmp/constraints.txt
