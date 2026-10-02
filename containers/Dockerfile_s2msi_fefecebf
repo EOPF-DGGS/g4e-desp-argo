@@ -1,0 +1,10 @@
+FROM quay.io/jupyter/minimal-notebook:x86_64-python-3.13.12
+USER root
+RUN apt-get update && apt-get install --yes --no-install-recommends build-essential && apt-get clean && rm -rf /var/lib/apt/lists/*
+USER ${NB_USER}
+RUN --mount=type=secret,id=gitlab_token,mode=0444 \
+    pip install --no-cache-dir \
+        "eopf[cluster-plugin]==3.0.0rc4" \
+        "s2msi @ git+https://oauth2:$(cat /run/secrets/gitlab_token)@gitlab.eopf.copernicus.eu/S2/msi/s2msi.git@fefecebf6ee943d4869321f3db32ef52a71186ed" && \
+    pip list --format=freeze > /opt/conda/pip-freeze.txt
+WORKDIR /home/${NB_USER}

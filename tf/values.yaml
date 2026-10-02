@@ -33,12 +33,12 @@ hub:
     02-profile-list: |
       async def profile_list(spawner):
           username = spawner.user.name
-          s2msi_users = ['pablo-richard', 'capetienne', 'cgueguen', 'j34ni', 'annefou', 'tinaok']
+          s2msi_users = ['pablo-richard', 'capetienne', 'cgueguen', 'j34ni', 'annefou', 'tinaok', 'jmdelouis']
           s3syn_users = ['j34ni', 'annefou', 'tinaok', 'tik65536']
 
           standard_profile = {
               'display_name': '✅ Standard (CPU)',
-              'description': 'Standard CPU environment — 2 to 16 CPUs, 8 to 32 GB RAM',
+              'description': 'Standard CPU environment - 2 to 16 CPUs, 8 to 32 GB RAM',
               'default': True,
               'kubespawner_override': {
                   'cpu_limit': 16,
@@ -54,7 +54,7 @@ hub:
 
           s2msi_profile = {
               'display_name': '🛰️ Sentinel-2 MSI (s2msi)',
-              'description': 'Sentinel-2 MSI processor environment — 2 to 16 CPUs, up to 64 GB RAM',
+              'description': 'Sentinel-2 MSI processor environment - 2 to 16 CPUs, up to 64 GB RAM',
               'kubespawner_override': {
                   'image': 'y74y55mn.gra7.container-registry.ovh.net/healpix-private/s2msi:latest',
                   'cpu_limit': 16,
@@ -86,11 +86,31 @@ hub:
               }
           }
 
+          s2msi_highmem_profile = {
+              'display_name': '🛰️ Sentinel-2 MSI - 128 GB (s2msi-fefecebf)',
+              'description': 'Sentinel-2 MSI processor - s2msi fefecebf / eopf 3.0.0rc4 - up to 118 GB RAM',
+              'kubespawner_override': {
+                  'image': 'y74y55mn.gra7.container-registry.ovh.net/healpix-private/s2msi:fefecebf',
+                  'cpu_limit': 16,
+                  'cpu_guarantee': 2,
+                  'mem_limit': '118G',
+                  'mem_guarantee': '96G',
+                  'node_selector': {
+                      'hub.jupyter.org/node-purpose': 'user',
+                      'node-role': 'highmem'
+                  },
+                  'tolerations': [
+                      {'key': 'node-role', 'operator': 'Equal', 'value': 'highmem', 'effect': 'NoSchedule'}
+                  ],
+                  'storage_home_mount_path': '/home/dask'
+              }
+          }
+
           s3syn_profile = {
               'display_name': '🔄 Sentinel-3 Synergy (s3syn)',
-              'description': 'Sentinel-3 SYNERGY processor environment — 2 to 16 CPUs, 8 to 32 GB RAM',
+              'description': 'Sentinel-3 SYNERGY processor environment - 2 to 16 CPUs, 8 to 32 GB RAM',
               'kubespawner_override': {
-                  'image': 'y74y55mn.gra7.container-registry.ovh.net/healpix-private/s3syn:latest',
+                  'image': 'y74y55mn.gra7.container-registry.ovh.net/healpix-private/s3syn:2026-10-01',
                   'image_pull_policy': 'Always',
                   'cpu_limit': 16,
                   'cpu_guarantee': 2,
@@ -105,7 +125,7 @@ hub:
 
           gpu_profile = {
               'display_name': '⚠️  GPU (NVIDIA A10, not available yet)',
-              'description': '1x NVIDIA A10 GPU — for heavier processing and HEALPix regriding',
+              'description': '1x NVIDIA A10 GPU - for heavier processing and HEALPix regriding',
               'kubespawner_override': {
                   'cpu_limit': 16,
                   'cpu_guarantee': 4,
@@ -121,6 +141,7 @@ hub:
           if username in s2msi_users:
               profiles.insert(1, s2msi_profile)
               profiles.insert(2, s2msi_minimal_profile)
+              profiles.insert(3, s2msi_highmem_profile)
           if username in s3syn_users:
               profiles.insert(-1, s3syn_profile)
           return profiles

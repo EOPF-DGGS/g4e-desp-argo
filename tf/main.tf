@@ -45,6 +45,11 @@ variable "s3_secret_key" {
   sensitive = true
 }
 
+variable "github_client_secret" {
+  type      = string
+  sensitive = true
+}
+
 provider "ovh" {
   endpoint = "ovh-eu"
 }
@@ -118,6 +123,42 @@ resource "ovh_cloud_project_kube_nodepool" "dask_worker_pool" {
     spec {
       unschedulable = false
       taints        = []
+    }
+  }
+}
+
+resource "ovh_cloud_project_kube_nodepool" "highmem_pool" {
+  service_name  = local.service_name
+  kube_id       = ovh_cloud_project_kube.cluster.id
+  name          = "highmem-workers"
+  flavor_name   = "r3-128"
+  desired_nodes = 1
+  min_nodes     = 0
+  max_nodes     = 2
+  autoscale     = true
+
+  lifecycle {
+    ignore_changes = [desired_nodes]
+  }
+
+  template {
+    metadata {
+      annotations = {}
+      finalizers  = []
+      labels = {
+        "hub.jupyter.org/node-purpose" = "user"
+        "node-role"                    = "highmem"
+      }
+    }
+    spec {
+      unschedulable = false
+      taints = [
+        {
+          key    = "node-role"
+          value  = "highmem"
+          effect = "NoSchedule"
+        }
+      ]
     }
   }
 }
@@ -214,7 +255,6 @@ resource "helm_release" "jupyterhub" {
   }
 
   values = [
-    file("${path.module}/secrets/values.yaml"),
     file("${path.module}/values.yaml"),
   ]
 
@@ -226,6 +266,14 @@ resource "helm_release" "jupyterhub" {
   set {
     name  = "hub.config.JupyterHub.authenticator_class"
     value = "github"
+  }
+  set {
+    name  = "hub.config.GitHubOAuthenticator.client_id"
+    value = "Ov23liayARBZxZnTXiaS"
+  }
+  set_sensitive {
+    name  = "hub.config.GitHubOAuthenticator.client_secret"
+    value = var.github_client_secret
   }
   set {
     name  = "hub.config.GitHubOAuthenticator.oauth_callback_url"

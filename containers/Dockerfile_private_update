@@ -1,0 +1,12 @@
+FROM y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:latest
+
+USER root
+RUN --mount=type=secret,id=github_token,mode=0444 \
+    /srv/conda/envs/notebook/bin/pip list --format=freeze \
+      | grep -v -i -E "^(legacy-converters|healpix-compress)==" > /tmp/constraints.txt && \
+    /srv/conda/envs/notebook/bin/pip install --no-cache-dir -c /tmp/constraints.txt \
+      "healpix-compress @ git+https://$(cat /run/secrets/github_token)@github.com/GRID4EARTH/healpix-compress.git@9e75dc3e43713918096491e5ce73de5b13b78a70" \
+      "legacy-converters @ git+https://$(cat /run/secrets/github_token)@github.com/GRID4EARTH/legacy-converters.git@de458eb41a24f98e38533f32264cad1f0d965da8" && \
+    rm -f /tmp/constraints.txt
+
+USER ${NB_USER}
