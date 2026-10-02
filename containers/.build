@@ -8,6 +8,7 @@ docker pull y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyter
 docker build --progress=plain --secret id=github_token,env=GITHUB_TOKEN -t g4e-jupyterhub-private:2026-10-01 -f Dockerfile_private_update .
 docker pull y74y55mn.gra7.container-registry.ovh.net/healpix-private/s3syn:latest
 docker build --progress=plain -t g4e-s3syn:2026-10-01 -f Dockerfile_s3syn_update .
+docker build --progress=plain --secret id=gitlab_token,src=/home/ubuntu/.gitlab_token -t g4e-s2msi:fefecebf -f Dockerfile_s2msi_fefecebf .
 
 # To push on the OVHcloud Harbor
 
@@ -18,3 +19,5 @@ docker tag g4e-jupyterhub-private:2026-10-01 y74y55mn.gra7.container-registry.ov
 docker push y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-01
 docker tag g4e-s3syn:2026-10-01 y74y55mn.gra7.container-registry.ovh.net/healpix-private/s3syn:2026-10-01
 docker push y74y55mn.gra7.container-registry.ovh.net/healpix-private/s3syn:2026-10-01
+docker tag g4e-s2msi:fefecebf y74y55mn.gra7.container-registry.ovh.net/healpix-private/s2msi:fefecebf
+docker push y74y55mn.gra7.container-registry.ovh.net/healpix-private/s2msi:fefecebf
