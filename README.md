@@ -46,10 +46,18 @@ presentations.
    the EOPF Sample Service STAC, converts it with `legacy-converters` (HEALPix
    nested, WGS84 ellipsoid) and writes the result to the `g4e-desp-argo-artifacts`
    bucket.
-4. **Published datasets** live under `s3://grid4earth/public/`. The STAC API reads
-   `public/collections.json` from that bucket anonymously, STAC Browser and
-   Gridlook query the API, and the Zarr chunks are fetched over HTTPS from
-   `data.grid4earth.eu` (CORS and Range requests enabled, no credentials).
+4. **Published datasets** live under `s3://grid4earth/public/` (`converted/`,
+   `eopf-mirror/`, `auxiliary/`, see the bucket layout in
+   [project-guidelines](https://github.com/GRID4EARTH/project-guidelines)). The
+   per-collection notebooks in
+   [legacy-datasets](https://github.com/GRID4EARTH/legacy-datasets) run
+   `legacy-converters` on the platform and write there.
+   [stac-scraper](https://github.com/GRID4EARTH/stac-scraper) then scans the
+   bucket, extracts the STAC item embedded in each EOPF Zarr store and writes
+   per-collection stac-geoparquet files plus `public/collections.json`. The STAC
+   API reads that index anonymously, STAC Browser and Gridlook query the API, and
+   the Zarr chunks are fetched over HTTPS from `data.grid4earth.eu` (CORS and
+   Range requests enabled, no credentials).
 5. **Container images** for notebooks, Dask and Argo are the same
    `g4e-jupyterhub-private` image, built from `containers/` and pushed to the
    private Harbor registry. It bundles the GRID4EARTH packages (`healpix-geo`,
@@ -89,7 +97,11 @@ the S3 proxy and the STAC stack. Secrets are kept in `secrets/` (git-crypt) and 
 
 - [healpix-geo](https://github.com/GRID4EARTH/healpix-geo), [healpix-resample](https://github.com/GRID4EARTH/healpix-resample), [healpix-plot](https://github.com/GRID4EARTH/healpix-plot), [healpix-compress](https://github.com/GRID4EARTH/healpix-compress), [healpix-analyse](https://github.com/GRID4EARTH/healpix-analyse) — HEALPix DGGS libraries installed in the images
 - [legacy-converters](https://github.com/GRID4EARTH/legacy-converters) — conversion of Sentinel products to HEALPix, used by the Argo workflows
-- [gridlook](https://github.com/GRID4EARTH/gridlook), [stac-browser](https://github.com/GRID4EARTH/stac-browser) — web viewers deployed or linked from the platform
+- [legacy-datasets](https://github.com/GRID4EARTH/legacy-datasets) — per-collection pipeline notebooks that produce the published HEALPix datasets
+- [stac-scraper](https://github.com/GRID4EARTH/stac-scraper) — builds the STAC index (`stac-geoparquet` + `collections.json`) served by the STAC API
+- [stac-browser](https://github.com/GRID4EARTH/stac-browser) (branch `gridlook-asset-action`, image `ghcr.io/j34ni/stac-browser:gridlook`) — the STAC Browser deployed here, with an "open in Gridlook" asset action
+- [gridlook](https://github.com/GRID4EARTH/gridlook) — 3-D viewer published on GitHub Pages, reached through `gridlook.grid4earth.eu`
+- [project-guidelines](https://github.com/GRID4EARTH/project-guidelines) — bucket layout, pipelines and user how-tos
 
 ## Licence
 
