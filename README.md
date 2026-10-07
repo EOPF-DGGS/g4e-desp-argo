@@ -11,10 +11,13 @@ manifests. The step-by-step deployment procedure is in [`tf/README.md`](tf/READM
 
 ## Architecture
 
-![GRID4EARTH DESP platform architecture](docs/architecture.svg)
+![GRID4EARTH DESP platform overview](docs/architecture-overview.svg)
 
-The SVG is in [`docs/architecture.svg`](docs/architecture.svg) and can be reused in
-presentations.
+The overview above ([`docs/architecture-overview.svg`](docs/architecture-overview.svg)) is
+meant for presentations. The detailed view below ([`docs/architecture.svg`](docs/architecture.svg))
+names every component, namespace, node pool, bucket and registry.
+
+![GRID4EARTH DESP platform architecture](docs/architecture.svg)
 
 ### Components
 
@@ -26,7 +29,7 @@ presentations.
 | Catalogue | stac-fastapi-geoparquet (STAC API) | https://stac-api.grid4earth.eu | `tf/grid4earth-stac-stack.yaml` |
 | Catalogue UI | STAC Browser with Gridlook plugin | https://stac-browser.grid4earth.eu | `tf/grid4earth-stac-stack.yaml` |
 | Visualisation | Gridlook (hosted on GitHub Pages, redirect from the cluster) | https://gridlook.grid4earth.eu | `tf/grid4earth-stac-stack.yaml` |
-| Data access | nginx-s3-gateway, public read-only front for `s3://grid4earth/public/` | https://data.grid4earth.eu | `tf/grid4earth-s3proxy.yaml` |
+| Data access | nginx-s3-gateway, public read-only front for `s3://grid4earth/public/` (object URLs only, the root and prefixes return 404) | https://data.grid4earth.eu/collections.json | `tf/grid4earth-s3proxy.yaml` |
 | Edge | NGINX Ingress Controller, cert-manager + Let's Encrypt, wildcard DNS `*.grid4earth.eu` | — | `tf/main.tf` |
 | Compute | OVH MKS node pools: `cpu-workers` (b3-64, 1–5), `dask-workers` (b3-64, 1–5), `highmem-workers` (r3-128, 0–2), GPU planned | — | `tf/main.tf` |
 | Storage | OVH Object Storage (S3, GRA): `grid4earth` (public data), `g4e-desp-argo-artifacts` (workflow outputs), `g4e-desp-state` (Tofu state) | — | `tf/main.tf`, `tf/argo-values.yaml` |

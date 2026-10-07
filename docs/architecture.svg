@@ -161,7 +161,7 @@
   <text x="758" y="677" class="h2">nginx-s3-gateway — <tspan class="host">data.grid4earth.eu</tspan></text>
   <text x="758" y="696" class="t">public, read-only HTTPS front for s3://grid4earth/public/</text>
   <text x="758" y="712" class="t">/&lt;path&gt; ↔ s3://grid4earth/public/&lt;path&gt; · CORS * · HTTP Range</text>
-  <text x="758" y="730" class="small">Zarr / cloud-optimised access from browsers and notebooks</text>
+  <text x="758" y="730" class="small">object URLs only, no index page: e.g. …/collections.json</text>
   <text x="758" y="745" class="small">without exposing credentials</text>
 
   <!-- Node pools -->
