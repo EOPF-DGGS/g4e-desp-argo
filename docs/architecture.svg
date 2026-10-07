@@ -85,7 +85,7 @@
     <rect x="787" y="170" width="110" height="26" rx="13" class="pill"/><text x="842" y="187">gridlook.</text>
     <rect x="905" y="170" width="110" height="26" rx="13" class="pill"/><text x="960" y="187">data.</text>
   </g>
-  <text x="1030" y="187" class="small">all under *.grid4earth.eu</text>
+  <text x="1030" y="187" class="small">*.grid4earth.eu</text>
 
   <!-- namespace: jupyterhub -->
   <rect x="305" y="225" width="410" height="540" rx="8" class="ns-box"/>
@@ -99,7 +99,7 @@
   <rect x="318" y="335" width="384" height="200" rx="6" class="svc"/>
   <text x="328" y="354" class="h2">Single-user notebook pods (one per user)</text>
   <text x="328" y="373" class="t">Profiles (shown per user allow-list):</text>
-  <text x="338" y="390" class="t">• Standard CPU — 2–16 CPU, 8–32 GB (image g4e-jupyterhub-private)</text>
+  <text x="338" y="390" class="t">• Standard CPU — 2–16 CPU, 8–32 GB</text>
   <text x="338" y="406" class="t">• Sentinel-2 MSI (s2msi, s2msi-minimal) — up to 64 GB</text>
   <text x="338" y="422" class="t">• Sentinel-2 MSI 128 GB (s2msi-fefecebf) — highmem pool, ≤ 118 GB</text>
   <text x="338" y="438" class="t">• Sentinel-3 SYNERGY (s3syn) — up to 32 GB</text>
@@ -150,7 +150,7 @@
   <text x="758" y="554" class="small">GRID4EARTH fork with Gridlook asset action · catalog = stac-api.*</text>
 
   <rect x="748" y="568" width="344" height="38" rx="6" class="svc"/>
-  <text x="758" y="584" class="h2">gridlook-redirect (nginx 301) — <tspan class="host">gridlook.grid4earth.eu</tspan></text>
+  <text x="758" y="584" class="h2">gridlook-redirect (301) — <tspan class="host">gridlook.grid4earth.eu</tspan></text>
   <text x="758" y="599" class="small">→ https://grid4earth.github.io/gridlook (GitHub Pages)</text>
 
   <!-- namespace: s3proxy -->
