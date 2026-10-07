@@ -57,7 +57,7 @@
   <rect x="685" y="160" width="310" height="200" rx="10" class="svc"/>
   <text x="705" y="194" class="h">Argo Workflows</text>
   <text x="705" y="222" class="t">batch conversion to HEALPix</text>
-  <text x="705" y="246" class="t">one workflow per product</text>
+  <text x="705" y="246" class="t">started from notebooks or the UI</text>
   <text x="705" y="270" class="t">legacy-converters on Sentinel-3</text>
   <text x="705" y="300" class="t">results and logs go to S3</text>
   <text x="705" y="336" class="host">argo.grid4earth.eu</text>
@@ -107,7 +107,6 @@
   <text x="160" y="360" class="lbl">browser</text>
 
   <path d="M 655 260 L 683 260" class="flow"/>
-  <text x="600" y="382" class="lbl">submit workflows →</text>
 
   <path d="M 1110 175 L 1050 175 L 1050 230 L 997 230" class="flow"/>
   <text x="1026" y="165" class="lbl">read EOPF</text>
@@ -122,5 +121,5 @@
   <text x="760" y="616" class="lbl">serve Zarr chunks</text>
 
   <path d="M 345 500 L 262 500" class="flow"/>
-  <text x="268" y="490" class="lbl">Zarr over HTTPS</text>
+  <text x="285" y="490" class="lbl">Zarr</text>
 </svg>
