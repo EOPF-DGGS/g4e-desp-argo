@@ -1,0 +1,282 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 1060" width="1500" height="1060" font-family="Inter, Helvetica, Arial, sans-serif">
+  <title>GRID4EARTH DESP platform architecture (g4e-desp-argo)</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#333"/>
+    </marker>
+    <marker id="arrow-dim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#777"/>
+    </marker>
+    <style>
+      .title { font-size: 26px; font-weight: 700; fill: #1b2a41; }
+      .subtitle { font-size: 14px; fill: #555; }
+      .h1 { font-size: 14px; font-weight: 700; fill: #1b2a41; }
+      .h2 { font-size: 13px; font-weight: 700; fill: #1b2a41; }
+      .ns { font-size: 12px; font-weight: 700; fill: #4a6fa5; letter-spacing: 0.3px; }
+      .t { font-size: 11.5px; fill: #333; }
+      .host { font-size: 11.5px; font-weight: 700; fill: #1b4f9c; }
+      .small { font-size: 10.5px; fill: #555; }
+      .lbl { font-size: 10.5px; fill: #333; font-style: italic; }
+      .cluster { fill: #f3f6fa; stroke: #4a6fa5; stroke-width: 2; }
+      .ns-box { fill: #ffffff; stroke: #9bb0cc; stroke-width: 1.2; stroke-dasharray: 5 3; }
+      .svc { fill: #e8f0fb; stroke: #4a6fa5; stroke-width: 1.2; }
+      .edge { fill: #dfe7f2; stroke: #4a6fa5; stroke-width: 1.2; }
+      .pill { fill: #ffffff; stroke: #4a6fa5; stroke-width: 1; }
+      .store { fill: #fdf3e2; stroke: #c98a2b; stroke-width: 1.5; }
+      .bucket { fill: #ffffff; stroke: #c98a2b; stroke-width: 1; }
+      .img { fill: #eef7ea; stroke: #5a9a4a; stroke-width: 1.5; }
+      .img-sub { fill: #ffffff; stroke: #5a9a4a; stroke-width: 1; }
+      .ext { fill: #f4eefa; stroke: #8a63b8; stroke-width: 1.5; }
+      .user { fill: #ffffff; stroke: #555; stroke-width: 1.5; }
+      .pool { fill: #e9ecef; stroke: #868e96; stroke-width: 1.2; }
+      .pool-pill { fill: #ffffff; stroke: #868e96; stroke-width: 1; }
+      .deploy { fill: #fff8e1; stroke: #b08a00; stroke-width: 1.5; }
+      .flow { fill: none; stroke: #333; stroke-width: 1.6; marker-end: url(#arrow); }
+      .flow-dim { fill: none; stroke: #777; stroke-width: 1.4; stroke-dasharray: 6 4; marker-end: url(#arrow-dim); }
+    </style>
+  </defs>
+
+  <rect width="1500" height="1060" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="30" y="42" class="title">GRID4EARTH — DESP platform architecture (OVHcloud, GRA9)</text>
+  <text x="30" y="66" class="subtitle">Infrastructure defined in GRID4EARTH/g4e-desp-argo: OpenTofu + Helm + Kubernetes manifests + container images</text>
+
+  <!-- ===================== LEFT COLUMN ===================== -->
+  <!-- Users -->
+  <rect x="30" y="100" width="220" height="130" rx="8" class="user"/>
+  <text x="45" y="124" class="h1">Users</text>
+  <text x="45" y="146" class="t">Scientists and developers</text>
+  <text x="45" y="164" class="t">Browser → JupyterLab, Argo UI,</text>
+  <text x="45" y="180" class="t">STAC Browser, Gridlook</text>
+  <text x="45" y="204" class="small">JupyterHub login: GitHub OAuth</text>
+  <text x="45" y="219" class="small">(per-user allow-list)</text>
+
+  <!-- Gridlook on GitHub Pages -->
+  <rect x="30" y="270" width="220" height="100" rx="8" class="ext"/>
+  <text x="45" y="294" class="h1">Gridlook (GitHub Pages)</text>
+  <text x="45" y="316" class="t">grid4earth.github.io/gridlook</text>
+  <text x="45" y="332" class="t">3-D viewer for HEALPix datasets</text>
+  <text x="45" y="353" class="small">calls stac-api.* and reads Zarr via data.*</text>
+
+  <!-- Legend -->
+  <rect x="30" y="700" width="220" height="150" rx="8" fill="#fafafa" stroke="#bbb" stroke-width="1"/>
+  <text x="45" y="724" class="h2">Legend</text>
+  <rect x="45" y="738" width="22" height="12" class="svc"/><text x="75" y="748" class="small">Kubernetes service / pods</text>
+  <rect x="45" y="758" width="22" height="12" class="store"/><text x="75" y="768" class="small">OVH Object Storage (S3)</text>
+  <rect x="45" y="778" width="22" height="12" class="img"/><text x="75" y="788" class="small">Container images, software</text>
+  <rect x="45" y="798" width="22" height="12" class="ext"/><text x="75" y="808" class="small">External service</text>
+  <line x1="45" y1="826" x2="67" y2="826" class="flow"/><text x="75" y="830" class="small">Data / request flow</text>
+  <line x1="45" y1="842" x2="67" y2="842" class="flow-dim"/><text x="75" y="846" class="small">Image pull / build</text>
+
+  <!-- ===================== CLUSTER ===================== -->
+  <rect x="290" y="100" width="830" height="770" rx="10" class="cluster"/>
+  <text x="305" y="124" class="h1">OVHcloud Public Cloud · project GRID4EARTH · region GRA9 — Managed Kubernetes (MKS) cluster «g4e-desp-cluster»</text>
+
+  <!-- Edge / ingress strip -->
+  <rect x="305" y="138" width="800" height="70" rx="6" class="edge"/>
+  <text x="315" y="157" class="h2">Edge: NGINX Ingress Controller (LoadBalancer) · cert-manager + Let's Encrypt TLS · DNS wildcard *.grid4earth.eu</text>
+  <g font-size="11.5" font-weight="700" fill="#1b4f9c" text-anchor="middle">
+    <rect x="315" y="170" width="110" height="26" rx="13" class="pill"/><text x="370" y="187">jupyterhub.</text>
+    <rect x="433" y="170" width="110" height="26" rx="13" class="pill"/><text x="488" y="187">argo.</text>
+    <rect x="551" y="170" width="110" height="26" rx="13" class="pill"/><text x="606" y="187">stac-api.</text>
+    <rect x="669" y="170" width="110" height="26" rx="13" class="pill"/><text x="724" y="187">stac-browser.</text>
+    <rect x="787" y="170" width="110" height="26" rx="13" class="pill"/><text x="842" y="187">gridlook.</text>
+    <rect x="905" y="170" width="110" height="26" rx="13" class="pill"/><text x="960" y="187">data.</text>
+  </g>
+  <text x="1030" y="187" class="small">*.grid4earth.eu</text>
+
+  <!-- namespace: jupyterhub -->
+  <rect x="305" y="225" width="410" height="540" rx="8" class="ns-box"/>
+  <text x="315" y="244" class="ns">namespace: jupyterhub</text>
+
+  <rect x="318" y="255" width="384" height="62" rx="6" class="svc"/>
+  <text x="328" y="274" class="h2">JupyterHub 4.3.2 (Zero-to-JupyterHub) — hub + proxy</text>
+  <text x="328" y="292" class="t">GitHub OAuth authenticator · KubeSpawner profile list</text>
+  <text x="328" y="308" class="host">https://jupyterhub.grid4earth.eu</text>
+
+  <rect x="318" y="335" width="384" height="200" rx="6" class="svc"/>
+  <text x="328" y="354" class="h2">Single-user notebook pods (one per user)</text>
+  <text x="328" y="373" class="t">Profiles (shown per user allow-list):</text>
+  <text x="338" y="390" class="t">• Standard CPU — 2–16 CPU, 8–32 GB</text>
+  <text x="338" y="406" class="t">• Sentinel-2 MSI (s2msi, s2msi-minimal) — up to 64 GB</text>
+  <text x="338" y="422" class="t">• Sentinel-2 MSI 128 GB (s2msi-fefecebf) — highmem pool, ≤ 118 GB</text>
+  <text x="338" y="438" class="t">• Sentinel-3 SYNERGY (s3syn) — up to 32 GB</text>
+  <text x="338" y="454" class="t">• GPU — planned, not available yet</text>
+  <text x="328" y="476" class="small">20 GiB home volume (Cinder) · S3 keys injected as env vars</text>
+  <text x="328" y="491" class="small">stack: healpix-geo, -resample, -compress, -analyse, legacy-converters, xdggs</text>
+  <text x="328" y="506" class="small">pipelines: legacy-datasets notebooks → legacy-converters →</text>
+  <text x="328" y="521" class="small">HEALPix Zarr written to s3://grid4earth/public/converted/</text>
+
+  <rect x="318" y="548" width="384" height="110" rx="6" class="svc"/>
+  <text x="328" y="567" class="h2">Dask Gateway 2025.4.0</text>
+  <text x="328" y="586" class="t">traefik proxy at /services/dask-gateway · JupyterHub auth</text>
+  <text x="328" y="602" class="t">scheduler 2–4 CPU / 8–16 GB · workers ≤ 16 CPU / ≤ 48 GB</text>
+  <text x="328" y="618" class="t">workers run on the «dask-workers» node pool</text>
+  <text x="328" y="640" class="small">limits per cluster: 128 cores / 512 GB · idle timeout 1 h</text>
+
+  <rect x="318" y="678" width="384" height="72" rx="6" fill="#ffffff" stroke="#9bb0cc" stroke-width="1"/>
+  <text x="328" y="697" class="h2">NetworkPolicies (egress from notebook pods)</text>
+  <text x="328" y="716" class="t">→ Dask Gateway traefik :8000</text>
+  <text x="328" y="732" class="t">→ Argo Workflows server :2746 (submit / watch workflows)</text>
+
+  <!-- namespace: argo -->
+  <rect x="735" y="225" width="370" height="200" rx="8" class="ns-box"/>
+  <text x="745" y="244" class="ns">namespace: argo</text>
+
+  <rect x="748" y="255" width="344" height="58" rx="6" class="svc"/>
+  <text x="758" y="274" class="h2">Argo Workflows 0.46.2 — server + controller</text>
+  <text x="758" y="291" class="host">https://argo.grid4earth.eu</text>
+  <text x="758" y="306" class="small">artifacts + logs → S3 bucket g4e-desp-argo-artifacts</text>
+
+  <rect x="748" y="328" width="344" height="88" rx="6" class="svc"/>
+  <text x="758" y="347" class="h2">WorkflowTemplate «legacy-converters-sentinel-3»</text>
+  <text x="758" y="365" class="t">image g4e-jupyterhub-private · 4 CPU / 16 GiB per run</text>
+  <text x="758" y="381" class="t">EOPF STAC item → legacy-converters → HEALPix Zarr</text>
+  <text x="758" y="397" class="t">(nested, WGS84 ellipsoid) → S3</text>
+  <text x="758" y="411" class="small">submitted from notebooks or the Argo UI</text>
+
+  <!-- namespace: stac -->
+  <rect x="735" y="442" width="370" height="170" rx="8" class="ns-box"/>
+  <text x="745" y="461" class="ns">namespace: stac</text>
+
+  <rect x="748" y="470" width="344" height="46" rx="6" class="svc"/>
+  <text x="758" y="487" class="h2">stac-fastapi-geoparquet — <tspan class="host">stac-api.grid4earth.eu</tspan></text>
+  <text x="758" y="505" class="small">reads public/collections.json from bucket grid4earth (anonymous)</text>
+
+  <rect x="748" y="522" width="344" height="40" rx="6" class="svc"/>
+  <text x="758" y="539" class="h2">STAC Browser — <tspan class="host">stac-browser.grid4earth.eu</tspan></text>
+  <text x="758" y="554" class="small">GRID4EARTH fork with Gridlook asset action · catalog = stac-api.*</text>
+
+  <rect x="748" y="568" width="344" height="38" rx="6" class="svc"/>
+  <text x="758" y="584" class="h2">gridlook-redirect (301) — <tspan class="host">gridlook.grid4earth.eu</tspan></text>
+  <text x="758" y="599" class="small">→ https://grid4earth.github.io/gridlook (GitHub Pages)</text>
+
+  <!-- namespace: s3proxy -->
+  <rect x="735" y="630" width="370" height="135" rx="8" class="ns-box"/>
+  <text x="745" y="649" class="ns">namespace: s3proxy</text>
+
+  <rect x="748" y="658" width="344" height="98" rx="6" class="svc"/>
+  <text x="758" y="677" class="h2">nginx-s3-gateway — <tspan class="host">data.grid4earth.eu</tspan></text>
+  <text x="758" y="696" class="t">public, read-only HTTPS front for s3://grid4earth/public/</text>
+  <text x="758" y="712" class="t">/&lt;path&gt; ↔ s3://grid4earth/public/&lt;path&gt; · CORS * · HTTP Range</text>
+  <text x="758" y="730" class="small">object URLs only, no index page: e.g. …/collections.json</text>
+  <text x="758" y="745" class="small">without exposing credentials</text>
+
+  <!-- Node pools -->
+  <rect x="305" y="782" width="800" height="76" rx="6" class="pool"/>
+  <text x="315" y="800" class="h2">Node pools (autoscaling, OVH flavours)</text>
+  <g font-size="11" fill="#333">
+    <rect x="315" y="810" width="190" height="40" rx="6" class="pool-pill"/>
+    <text x="325" y="826" font-weight="700">cpu-workers · b3-64 · 1–5</text><text x="325" y="842">notebooks, schedulers, services</text>
+    <rect x="515" y="810" width="190" height="40" rx="6" class="pool-pill"/>
+    <text x="525" y="826" font-weight="700">dask-workers · b3-64 · 1–5</text><text x="525" y="842">Dask Gateway workers</text>
+    <rect x="715" y="810" width="190" height="40" rx="6" class="pool-pill"/>
+    <text x="725" y="826" font-weight="700">highmem-workers · r3-128 · 0–2</text><text x="725" y="842">taint node-role=highmem</text>
+    <rect x="915" y="810" width="185" height="40" rx="6" class="pool-pill"/>
+    <text x="925" y="826" font-weight="700">gpu · planned</text><text x="925" y="842">GPU flavour under evaluation</text>
+  </g>
+
+  <!-- ===================== RIGHT COLUMN ===================== -->
+  <!-- EOPF external -->
+  <rect x="1180" y="100" width="290" height="100" rx="8" class="ext"/>
+  <text x="1195" y="124" class="h1">EOPF Sample Service (external)</text>
+  <text x="1195" y="146" class="t">STAC API: stac.core.eopf.eodc.eu</text>
+  <text x="1195" y="162" class="t">Sentinel-2 MSI · Sentinel-3 OLCI / SYN</text>
+  <text x="1195" y="178" class="t">EOPF Zarr products (input data)</text>
+
+  <!-- Object storage -->
+  <rect x="1180" y="222" width="290" height="260" rx="8" class="store"/>
+  <text x="1195" y="246" class="h1">OVH Object Storage (S3, region GRA)</text>
+  <text x="1195" y="262" class="small">endpoint s3.gra.io.cloud.ovh.net</text>
+
+  <rect x="1192" y="272" width="266" height="52" rx="5" class="bucket"/>
+  <text x="1202" y="289" class="h2">g4e-desp-argo-artifacts</text>
+  <text x="1202" y="304" class="t">workflow outputs: HEALPix Zarr datasets</text>
+  <text x="1202" y="318" class="small">+ archived workflow logs</text>
+
+  <rect x="1192" y="332" width="266" height="48" rx="5" class="bucket"/>
+  <text x="1202" y="349" class="h2">g4e-desp-state</text>
+  <text x="1202" y="364" class="t">OpenTofu state (jupyterhub.tfstate)</text>
+
+  <rect x="1192" y="388" width="266" height="84" rx="5" class="bucket"/>
+  <text x="1202" y="405" class="h2">grid4earth</text>
+  <text x="1202" y="420" class="t">public/ → served at data.grid4earth.eu</text>
+  <text x="1202" y="435" class="t">public/{converted,eopf-mirror,auxiliary}/ Zarr</text>
+  <text x="1202" y="450" class="t">public/stac/*.parquet + collections.json (STAC)</text>
+  <text x="1202" y="465" class="small">(STAC index built by stac-scraper from the bucket)</text>
+
+  <!-- Images & software -->
+  <rect x="1180" y="505" width="290" height="353" rx="8" class="img"/>
+  <text x="1195" y="529" class="h1">Container images &amp; software</text>
+
+  <rect x="1192" y="541" width="266" height="80" rx="5" class="img-sub"/>
+  <text x="1202" y="558" class="h2">OVH Harbor — project healpix-private</text>
+  <text x="1202" y="574" class="t">g4e-jupyterhub-private · s2msi · s3syn</text>
+  <text x="1202" y="589" class="small">pulled with harbor-pull-secret by</text>
+  <text x="1202" y="603" class="small">JupyterHub, Dask Gateway and Argo</text>
+  <text x="1202" y="616" class="small">(built locally, see containers/.build)</text>
+
+  <rect x="1192" y="631" width="266" height="54" rx="5" class="img-sub"/>
+  <text x="1202" y="648" class="h2">GHCR — ghcr.io/j34ni/g4e-notebook</text>
+  <text x="1202" y="663" class="t">public base image (pangeo-notebook)</text>
+  <text x="1202" y="678" class="small">built by GitHub Actions from containers/</text>
+
+  <text x="1195" y="709" class="h2">Software sources (containers/Dockerfile*)</text>
+  <text x="1195" y="727" class="t">GitHub GRID4EARTH:</text>
+  <text x="1205" y="743" class="t">healpix-geo, healpix-resample, healpix-plot,</text>
+  <text x="1205" y="759" class="t">healpix-compress, healpix-analyse,</text>
+  <text x="1205" y="775" class="t">legacy-converters, legacy-datasets</text>
+  <text x="1195" y="795" class="t">EOPF GitLab: s2msi, s3syn, eopf</text>
+  <text x="1195" y="815" class="t">PyPI / conda-forge: xdggs, xarray, dask, torch,</text>
+  <text x="1205" y="831" class="t">pystac-client, argo-workflows</text>
+  <text x="1195" y="851" class="small">Related: stac-scraper, stac-browser fork, gridlook</text>
+
+  <!-- ===================== DEPLOY STRIP ===================== -->
+  <rect x="30" y="890" width="1440" height="150" rx="8" class="deploy"/>
+  <text x="45" y="914" class="h1">Deployment &amp; operations (this repository, directory tf/)</text>
+  <text x="45" y="938" class="t"><tspan font-weight="700">OpenTofu (main.tf):</tspan> OVH MKS cluster + node pools → Helm releases ingress-nginx, cert-manager, jupyterhub (values.yaml), dask-gateway (dask-gateway-values.yaml), argo-workflows (argo-values.yaml) → ClusterIssuer, image-pull and S3 Secrets, NetworkPolicies</text>
+  <text x="45" y="958" class="t"><tspan font-weight="700">kubectl apply:</tspan> grid4earth-stac-stack.yaml (STAC API, STAC Browser, gridlook redirect) · grid4earth-s3proxy.yaml (nginx-s3-gateway) · workflows/argo_workflow_sentinel_3.yaml (WorkflowTemplate)</text>
+  <text x="45" y="978" class="t"><tspan font-weight="700">Containers (containers/):</tspan> Dockerfile (public base, CI → GHCR) · Dockerfile_private, _s2msi*, _s3syn* (private processors, built with tokens, pushed to Harbor)</text>
+  <text x="45" y="998" class="t"><tspan font-weight="700">State &amp; secrets:</tspan> Tofu state in S3 bucket g4e-desp-state · credentials in secrets/ (git-crypt) and *.tfvars (never committed) · DNS zone grid4earth.eu on OVH, wildcard A record → ingress LoadBalancer IP</text>
+  <text x="45" y="1022" class="small">Hostnames: jupyterhub · argo · stac-api · stac-browser · gridlook · data — all *.grid4earth.eu with Let's Encrypt certificates issued by cert-manager (HTTP-01).</text>
+
+  <!-- ===================== FLOWS ===================== -->
+  <!-- Users -> edge -->
+  <path d="M 250 165 L 303 165" class="flow"/>
+  <text x="258" y="158" class="lbl">HTTPS</text>
+
+  <!-- Gridlook -> edge -->
+  <path d="M 250 320 L 272 320 L 272 190 L 303 190" class="flow"/>
+
+  <!-- notebook pods -> Dask Gateway -->
+  <path d="M 510 535 L 510 546" class="flow"/>
+  <text x="518" y="544" class="lbl">spawn Dask clusters</text>
+
+  <!-- notebook pods -> Argo server -->
+  <path d="M 702 400 L 724 400 L 724 284 L 746 284" class="flow"/>
+  <text x="716" y="300" class="lbl" transform="rotate(-90 716 300)" text-anchor="end">submit workflows</text>
+
+  <!-- Argo server -> WorkflowTemplate -->
+  <path d="M 920 313 L 920 326" class="flow"/>
+
+  <!-- EOPF -> WorkflowTemplate (read input) -->
+  <path d="M 1180 150 L 1134 150 L 1134 340 L 1094 340" class="flow"/>
+  <text x="1130" y="250" class="lbl" transform="rotate(90 1130 250)" text-anchor="middle">read EOPF Zarr via STAC</text>
+
+  <!-- WorkflowTemplate -> artifacts bucket (write output) -->
+  <path d="M 1092 395 L 1150 395 L 1150 298 L 1190 298" class="flow"/>
+  <text x="1146" y="348" class="lbl" transform="rotate(90 1146 348)" text-anchor="middle">write HEALPix Zarr</text>
+
+  <!-- STAC API -> grid4earth bucket -->
+  <path d="M 1092 495 L 1162 495" fill="none" stroke="#333" stroke-width="1.6"/>
+  <!-- s3proxy -> grid4earth bucket (shares the vertical with the STAC API flow) -->
+  <path d="M 1092 700 L 1162 700 L 1162 440 L 1190 440" class="flow"/>
+  <text x="1176" y="570" class="lbl" transform="rotate(90 1176 570)" text-anchor="middle">read bucket grid4earth</text>
+
+  <!-- Harbor -> node pools (image pull) -->
+  <path d="M 1180 820 L 1107 820" class="flow-dim"/>
+  <text x="1143" y="812" class="lbl" text-anchor="middle">image pull</text>
+
+</svg>

@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 720" width="1400" height="720" font-family="Inter, Helvetica, Arial, sans-serif">
+  <title>GRID4EARTH DESP platform — overview</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1b2a41"/>
+    </marker>
+    <style>
+      .title { font-size: 30px; font-weight: 700; fill: #1b2a41; }
+      .subtitle { font-size: 16px; fill: #555; }
+      .cluster-label { font-size: 17px; font-weight: 700; fill: #4a6fa5; }
+      .h { font-size: 21px; font-weight: 700; fill: #1b2a41; }
+      .t { font-size: 15.5px; fill: #333; }
+      .host { font-size: 15.5px; font-weight: 700; fill: #1b4f9c; }
+      .lbl { font-size: 14px; fill: #333; font-style: italic; }
+      .foot { font-size: 15px; fill: #333; }
+      .cluster { fill: #f3f6fa; stroke: #4a6fa5; stroke-width: 2.5; }
+      .svc { fill: #e8f0fb; stroke: #4a6fa5; stroke-width: 2; }
+      .store { fill: #fdf3e2; stroke: #c98a2b; stroke-width: 2; }
+      .ext { fill: #f4eefa; stroke: #8a63b8; stroke-width: 2; }
+      .user { fill: #ffffff; stroke: #555; stroke-width: 2; }
+      .deploy { fill: #fff8e1; stroke: #b08a00; stroke-width: 1.5; }
+      .flow { fill: none; stroke: #1b2a41; stroke-width: 2.4; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1400" height="720" fill="#ffffff"/>
+
+  <text x="40" y="46" class="title">GRID4EARTH DESP platform — overview</text>
+  <text x="40" y="74" class="subtitle">One Kubernetes cluster on OVHcloud: interactive analysis, batch conversion to HEALPix, a STAC catalogue and public data access</text>
+
+  <!-- Users -->
+  <rect x="40" y="150" width="220" height="140" rx="10" class="user"/>
+  <text x="60" y="184" class="h">Users</text>
+  <text x="60" y="212" class="t">scientists, developers</text>
+  <text x="60" y="236" class="t">browser or JupyterLab</text>
+  <text x="60" y="260" class="t">GitHub login</text>
+
+  <!-- Gridlook -->
+  <rect x="40" y="420" width="220" height="130" rx="10" class="ext"/>
+  <text x="60" y="454" class="h">Gridlook</text>
+  <text x="60" y="482" class="t">3-D HEALPix viewer</text>
+  <text x="60" y="506" class="t">runs in the browser</text>
+  <text x="60" y="530" class="host">gridlook.grid4earth.eu</text>
+
+  <!-- Cluster -->
+  <rect x="320" y="110" width="700" height="530" rx="14" class="cluster"/>
+  <text x="340" y="140" class="cluster-label">OVHcloud Managed Kubernetes · region GRA9 · https://*.grid4earth.eu</text>
+
+  <rect x="345" y="160" width="310" height="200" rx="10" class="svc"/>
+  <text x="365" y="194" class="h">JupyterHub + Dask</text>
+  <text x="365" y="222" class="t">interactive analysis at scale</text>
+  <text x="365" y="246" class="t">environments: CPU · s2msi · s3syn</text>
+  <text x="365" y="270" class="t">reads EOPF, writes HEALPix Zarr</text>
+  <text x="365" y="300" class="t">autoscaling node pools, up to 128 GB</text>
+  <text x="365" y="336" class="host">jupyterhub.grid4earth.eu</text>
+
+  <rect x="685" y="160" width="310" height="200" rx="10" class="svc"/>
+  <text x="705" y="194" class="h">Argo Workflows</text>
+  <text x="705" y="222" class="t">batch conversion to HEALPix</text>
+  <text x="705" y="246" class="t">started from notebooks or the UI</text>
+  <text x="705" y="270" class="t">legacy-converters on Sentinel-3</text>
+  <text x="705" y="300" class="t">results and logs go to S3</text>
+  <text x="705" y="336" class="host">argo.grid4earth.eu</text>
+
+  <rect x="345" y="400" width="310" height="200" rx="10" class="svc"/>
+  <text x="365" y="434" class="h">Public data access</text>
+  <text x="365" y="462" class="t">HTTPS front for the S3 bucket</text>
+  <text x="365" y="486" class="t">no login, CORS + Range requests</text>
+  <text x="365" y="510" class="t">object URLs only (no index page)</text>
+  <text x="365" y="546" class="host">data.grid4earth.eu/&lt;path&gt;</text>
+  <text x="365" y="572" class="t">e.g. …/collections.json</text>
+
+  <rect x="685" y="400" width="310" height="200" rx="10" class="svc"/>
+  <text x="705" y="434" class="h">STAC catalogue</text>
+  <text x="705" y="462" class="t">find datasets by collection,</text>
+  <text x="705" y="486" class="t">time and area</text>
+  <text x="705" y="510" class="t">STAC API + STAC Browser UI</text>
+  <text x="705" y="546" class="host">stac-api.grid4earth.eu</text>
+  <text x="705" y="572" class="host">stac-browser.grid4earth.eu</text>
+
+  <!-- EOPF -->
+  <rect x="1110" y="110" width="270" height="130" rx="10" class="ext"/>
+  <text x="1130" y="144" class="h">EOPF Sample Service</text>
+  <text x="1130" y="172" class="t">Sentinel-2 and Sentinel-3</text>
+  <text x="1130" y="196" class="t">EOPF Zarr products (input)</text>
+  <text x="1130" y="222" class="t">stac.core.eopf.eodc.eu</text>
+
+  <!-- S3 -->
+  <rect x="1110" y="300" width="270" height="220" rx="10" class="store"/>
+  <text x="1130" y="334" class="h">Object storage (S3)</text>
+  <text x="1130" y="362" class="t">HEALPix Zarr datasets</text>
+  <text x="1130" y="386" class="t">(nested, WGS84 ellipsoid)</text>
+  <text x="1130" y="414" class="t">STAC index: geoparquet +</text>
+  <text x="1130" y="438" class="t">collections.json</text>
+  <text x="1130" y="470" class="t">bucket grid4earth, OVH GRA</text>
+  <text x="1130" y="496" class="t">+ workflow artifacts bucket</text>
+
+  <!-- Deploy strip -->
+  <rect x="40" y="660" width="1320" height="44" rx="8" class="deploy"/>
+  <text x="60" y="688" class="foot">Deployed with OpenTofu + Helm from GRID4EARTH/g4e-desp-argo · container images from OVH Harbor · TLS by Let's Encrypt · DNS *.grid4earth.eu</text>
+
+  <!-- Flows -->
+  <path d="M 260 220 L 343 220" class="flow"/>
+  <text x="268" y="210" class="lbl">HTTPS</text>
+
+  <path d="M 150 290 L 150 418" class="flow"/>
+  <text x="160" y="360" class="lbl">browser</text>
+
+  <path d="M 655 260 L 683 260" class="flow"/>
+
+  <path d="M 1110 175 L 1050 175 L 1050 230 L 997 230" class="flow"/>
+  <text x="1026" y="165" class="lbl">read EOPF</text>
+
+  <path d="M 995 330 L 1108 330" class="flow"/>
+  <text x="1030" y="320" class="lbl">write</text>
+
+  <path d="M 1110 480 L 997 480" class="flow"/>
+  <text x="1030" y="470" class="lbl">index</text>
+
+  <path d="M 1110 505 L 1065 505 L 1065 622 L 500 622 L 500 602" class="flow"/>
+  <text x="760" y="616" class="lbl">serve Zarr chunks</text>
+
+  <path d="M 345 500 L 262 500" class="flow"/>
+  <text x="285" y="490" class="lbl">Zarr</text>
+</svg>
