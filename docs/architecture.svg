@@ -204,7 +204,7 @@
   <text x="1202" y="405" class="h2">grid4earth</text>
   <text x="1202" y="420" class="t">public/ → served at data.grid4earth.eu</text>
   <text x="1202" y="435" class="t">public/{converted,eopf-mirror,auxiliary}/ Zarr</text>
-  <text x="1202" y="450" class="t">public/stac/*.parquet + collections.json (STAC)</text>
+  <text x="1202" y="450" class="t">public/*_-_*.parquet + collections.json (STAC)</text>
   <text x="1202" y="465" class="small">(STAC index built by stac-scraper from the bucket)</text>
 
   <!-- Images & software -->
