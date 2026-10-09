@@ -14,7 +14,7 @@ server:
     enabled: false
   serviceType: ClusterIP
   ingress:
-    enabled: true
+    enabled: false
     annotations:
       cert-manager.io/cluster-issuer: letsencrypt-jupyterhub
     ingressClassName: nginx-jupyterhub
