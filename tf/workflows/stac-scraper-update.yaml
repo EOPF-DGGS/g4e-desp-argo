@@ -1,0 +1,425 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: stac-scraper-update
+  namespace: argo
+spec:
+  # Refreshes the public STAC index (per-collection stac-geoparquet files and
+  # collections.json under bucket_prefix) with stac-scraper.
+  #
+  # Only the top-level categories listed in include_categories are re-scraped;
+  # every other top-level directory is passed to --exclude-categories (tmp and
+  # healpix-resample-paper are always excluded). collections.json is rebuilt
+  # from every *.parquet file present under bucket_prefix, so the collections of
+  # the categories that were not re-scraped stay in the index.
+  #
+  # Safety checks before publishing:
+  #   - a dataset directory without a root zarr.json (an interrupted upload) makes
+  #     stac-scraper fail: such directories are listed and the run stops before
+  #     scraping (delete them or re-run the step that writes them);
+  #   - collections.json is not published when it would drop collections of the
+  #     published one, unless allow_removals=true (the parquet files are uploaded
+  #     already then, which changes nothing for the dropped collections).
+  # A mutex keeps two runs from publishing at the same time. The stac-index
+  # artifact is stored at an explicit S3 location
+  # (s3://g4e-desp-argo-artifacts/stac-scraper-update/<workflow uid>/), so the
+  # template does not depend on the default artifact repository of the controller.
+  #
+  # The "main" template is self-contained (template-level volumes) so other
+  # workflows can call it with
+  #   templateRef: {name: stac-scraper-update, template: main}
+  entrypoint: main
+  serviceAccountName: argo-workflow
+  imagePullSecrets:
+    - name: harbor-pull-secret
+  arguments:
+    parameters:
+      - name: include_categories
+        value: eopf-mirror,converted
+      - name: bucket_prefix
+        value: s3://grid4earth/public
+      - name: dry_run
+        value: "false"
+      - name: allow_removals
+        value: "false"
+        description: publish collections.json even when it drops collections of the published one
+      - name: s3_endpoint
+        value: https://s3.gra.io.cloud.ovh.net
+      - name: orbit_image
+        value: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-10-orbit
+  templates:
+  - name: main
+    inputs:
+      parameters:
+        - name: include_categories
+          default: eopf-mirror,converted
+        - name: bucket_prefix
+          default: s3://grid4earth/public
+        - name: dry_run
+          default: "false"
+        - name: allow_removals
+          default: "false"
+        - name: s3_endpoint
+          default: https://s3.gra.io.cloud.ovh.net
+        - name: orbit_image
+          default: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-10-orbit
+    outputs:
+      artifacts:
+        # the generated index (parquet files + collections.json), also kept
+        # for dry runs so it can be inspected before publishing
+        - name: stac-index
+          path: /work/stac
+          optional: true
+          s3:
+            endpoint: s3.gra.io.cloud.ovh.net
+            region: gra
+            insecure: false
+            bucket: g4e-desp-argo-artifacts
+            key: "stac-scraper-update/{{workflow.uid}}/stac-index.tgz"
+            accessKeySecret:
+              name: argo-s3-credentials
+              key: accessKey
+            secretKeySecret:
+              name: argo-s3-credentials
+              key: secretKey
+    synchronization:
+      mutexes:
+        - name: stac-scraper-update
+    activeDeadlineSeconds: 7200
+    volumes:
+      - name: stac-scraper-s3-creds
+        secret:
+          secretName: argo-s3-credentials
+      - name: stac-scraper-work
+        emptyDir: {}
+    script:
+      name: ""
+      image: "{{inputs.parameters.orbit_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        limits:
+          cpu: "2"
+          memory: 4Gi
+        requests:
+          cpu: "1"
+          memory: 2Gi
+      volumeMounts:
+        - name: stac-scraper-s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+        - name: stac-scraper-work
+          mountPath: /work
+      source: |
+        import configparser
+        import json
+        import os
+        import pathlib
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+        from concurrent.futures import ThreadPoolExecutor
+
+        from fsspec.core import url_to_fs
+
+        include_categories = "{{inputs.parameters.include_categories}}"
+        bucket_prefix = "{{inputs.parameters.bucket_prefix}}"
+        dry_run = "{{inputs.parameters.dry_run}}"
+        allow_removals = "{{inputs.parameters.allow_removals}}"
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        S3_CREDS_DIR = "/etc/s3"
+        WORK_DIR = "/work"
+        # checkout of the stac-scraper repository in the orbit image: the asset
+        # and collection templates (assets/, collections/) live at its root
+        SCRAPER_DIR = "/opt/stac-scraper"
+        AWS_PROFILE = "grid4earth"
+        S3_REGION = "gra"
+        ALWAYS_EXCLUDED = ("tmp", "healpix-resample-paper")
+        CONTENT_TYPES = {
+            ".parquet": "application/vnd.apache.parquet",
+            ".json": "application/json",
+        }
+
+
+        def read_s3_credentials():
+            creds_dir = pathlib.Path(S3_CREDS_DIR)
+            access_key = (creds_dir / "accessKey").read_text().strip()
+            secret_key = (creds_dir / "secretKey").read_text().strip()
+            return access_key, secret_key
+
+
+        def storage_options_for(url):
+            if not url.startswith("s3://"):
+                return {}
+            access_key, secret_key = read_s3_credentials()
+            return {
+                "key": access_key,
+                "secret": secret_key,
+                "client_kwargs": {"endpoint_url": s3_endpoint},
+                # the index is read anonymously by the STAC API: every object
+                # written by this template must be public-read
+                "s3_additional_kwargs": {"ACL": "public-read"},
+            }
+
+
+        def write_private_file(path, parser):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                parser.write(f)
+
+
+        def scraper_env(home, prefix):
+            """Environment of the stac-scraper subprocesses.
+
+            For s3:// prefixes, the "grid4earth" AWS profile is written into a
+            private temporary HOME (removed at the end of the run).
+            """
+            env = dict(os.environ)
+            for name in (
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_PROFILE",
+                "AWS_DEFAULT_PROFILE",
+            ):
+                env.pop(name, None)
+            env["HOME"] = str(home)
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            if prefix.startswith("s3://"):
+                access_key, secret_key = read_s3_credentials()
+                aws_dir = home / ".aws"
+                aws_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                config = configparser.RawConfigParser()
+                config[f"profile {AWS_PROFILE}"] = {
+                    "region": S3_REGION,
+                    "endpoint_url": s3_endpoint,
+                }
+                credentials = configparser.RawConfigParser()
+                credentials[AWS_PROFILE] = {
+                    "aws_access_key_id": access_key,
+                    "aws_secret_access_key": secret_key,
+                }
+                write_private_file(aws_dir / "config", config)
+                write_private_file(aws_dir / "credentials", credentials)
+                env["AWS_CONFIG_FILE"] = str(aws_dir / "config")
+                env["AWS_SHARED_CREDENTIALS_FILE"] = str(aws_dir / "credentials")
+                env["AWS_REGION"] = S3_REGION
+                env["AWS_DEFAULT_REGION"] = S3_REGION
+                env["AWS_EC2_METADATA_DISABLED"] = "true"
+            return env
+
+
+        def run_scraper(args, env):
+            print("+ stac-scraper " + " ".join(args), flush=True)
+            subprocess.run(
+                [sys.executable, "-m", "stac_scraper", *args],
+                cwd=SCRAPER_DIR,
+                env=env,
+                check=True,
+            )
+
+
+        def list_entries(fs, root, kind):
+            fs.invalidate_cache()
+            try:
+                entries = fs.ls(root, detail=True)
+            except FileNotFoundError:
+                return []
+            return sorted(
+                entry["name"].rstrip("/").rsplit("/", 1)[-1]
+                for entry in entries
+                if entry["type"] == kind
+            )
+
+
+        def stores_without_zarr_json(fs, root, categories, excluded):
+            """Dataset directories <category>/<collection>/<dataset> without a root
+            zarr.json: stac-scraper fails on them (it only skips a zarr.json without
+            stac_discovery, e.g. a dataset still being written)."""
+            candidates = []
+            for category in categories:
+                for collection in list_entries(fs, f"{root}/{category}", "directory"):
+                    if collection in excluded:
+                        continue
+                    prefix = f"{root}/{category}/{collection}"
+                    candidates += [f"{prefix}/{name}" for name in list_entries(fs, prefix, "directory")]
+            with ThreadPoolExecutor(16) as pool:
+                found = list(pool.map(lambda path: fs.exists(f"{path}/zarr.json"), candidates))
+            print(f"{len(candidates)} datasets under {', '.join(categories)}")
+            return [path for path, ok in zip(candidates, found) if not ok]
+
+
+        def parquet_rows(path):
+            try:
+                import pyarrow.parquet as pq
+            except ImportError:
+                return "?"
+            return pq.ParquetFile(path).metadata.num_rows
+
+
+        def upload(fs, prefix, local_path, remote_path):
+            kwargs = {}
+            if prefix.startswith("s3://"):
+                content_type = CONTENT_TYPES.get(local_path.suffix)
+                if content_type is not None:
+                    kwargs["ContentType"] = content_type
+            else:
+                fs.makedirs(remote_path.rsplit("/", 1)[0], exist_ok=True)
+            fs.put_file(str(local_path), remote_path, **kwargs)
+            print(f"uploaded {local_path.name} -> {remote_path}", flush=True)
+
+
+        def read_remote_collection_ids(fs, path):
+            try:
+                collections = json.loads(fs.cat_file(path))
+            except FileNotFoundError:
+                return None
+            return {collection["id"] for collection in collections}
+
+
+        def main():
+            prefix = bucket_prefix.strip().rstrip("/")
+            publish = dry_run.strip().lower() not in ("true", "yes", "1")
+            removals_allowed = allow_removals.strip().lower() in ("true", "yes", "1")
+            requested = [c.strip() for c in include_categories.split(",") if c.strip()]
+            if not requested:
+                raise SystemExit("include_categories is empty")
+
+            fs, root = url_to_fs(prefix, **storage_options_for(prefix))
+            root = root.rstrip("/")
+
+            top_level = list_entries(fs, root, "directory")
+            print(f"top-level categories under {prefix}: {', '.join(top_level)}")
+            forced = sorted(set(requested) & set(ALWAYS_EXCLUDED))
+            if forced:
+                print(f"WARNING: always excluded, not scraped: {', '.join(forced)}")
+            missing = sorted(set(requested) - set(top_level) - set(ALWAYS_EXCLUDED))
+            if missing:
+                print(f"WARNING: requested but not present under {prefix}: {', '.join(missing)}")
+            scraped = sorted((set(requested) & set(top_level)) - set(ALWAYS_EXCLUDED))
+            if not scraped:
+                raise SystemExit(f"none of {requested} exists under {prefix}")
+            excluded = sorted((set(top_level) - set(scraped)) | set(ALWAYS_EXCLUDED))
+            print(f"scraping: {', '.join(scraped)}")
+            print(f"excluding: {', '.join(excluded)}")
+
+            broken = stores_without_zarr_json(fs, root, scraped, set(excluded))
+            if broken:
+                for path in broken:
+                    print(f"  no zarr.json: {path}")
+                raise SystemExit(
+                    f"{len(broken)} dataset(s) without a root zarr.json (interrupted uploads?) "
+                    "would make stac-scraper fail: delete them or re-run the step that writes them"
+                )
+
+            stac_dir = pathlib.Path(WORK_DIR) / "stac"
+            if stac_dir.exists():
+                shutil.rmtree(stac_dir)
+            stac_dir.mkdir(parents=True)
+
+            home = pathlib.Path(tempfile.mkdtemp(prefix="stac-scraper-home-"))
+            try:
+                env = scraper_env(home, prefix)
+                common = ["--profile", AWS_PROFILE, "--endpoint", s3_endpoint]
+
+                run_scraper(
+                    [
+                        "scrape-items",
+                        *common,
+                        "--local-output-root",
+                        str(stac_dir),
+                        "--exclude-categories",
+                        ",".join(excluded),
+                        prefix,
+                        "assets",
+                    ],
+                    env,
+                )
+
+                parquets = sorted(stac_dir.rglob("*.parquet"))
+                if not parquets:
+                    raise SystemExit("scrape-items wrote no parquet file")
+                remote_parquets = set(
+                    name for name in list_entries(fs, root, "file") if name.endswith(".parquet")
+                )
+                print("generated parquet files:")
+                new_parquets = []
+                for path in parquets:
+                    rel = path.relative_to(stac_dir).as_posix()
+                    state = "replace" if rel in remote_parquets else "NEW"
+                    if state == "NEW":
+                        new_parquets.append(rel)
+                    print(
+                        f"  {rel}: {parquet_rows(path)} items, {path.stat().st_size} bytes"
+                        f" -> {prefix}/{rel} ({state})"
+                    )
+
+                # collections.json is derived from the *.parquet files present
+                # under the bucket prefix (not from the local output directory,
+                # which only holds the re-scraped categories): upload the parquet
+                # files first, then build collections.json and upload it last.
+                if publish:
+                    for path in parquets:
+                        rel = path.relative_to(stac_dir).as_posix()
+                        upload(fs, prefix, path, f"{root}/{rel}")
+                else:
+                    print("dry run: parquet files not uploaded")
+                    if new_parquets:
+                        print(
+                            "dry run: these collections are not in the bucket yet and"
+                            " are missing from the collections.json preview: "
+                            + ", ".join(new_parquets)
+                        )
+
+                run_scraper(
+                    [
+                        "copy-collections",
+                        *common,
+                        "--local-output-root",
+                        str(stac_dir),
+                        prefix,
+                        "collections",
+                    ],
+                    env,
+                )
+            finally:
+                shutil.rmtree(home, ignore_errors=True)
+
+            collections_path = stac_dir / "collections.json"
+            collections = json.loads(collections_path.read_text())
+            if not collections:
+                raise SystemExit("collections.json is empty, refusing to publish it")
+            new_ids = {collection["id"] for collection in collections}
+            old_ids = read_remote_collection_ids(fs, f"{root}/collections.json")
+            print(f"collections.json: {len(new_ids)} collections -> {prefix}/collections.json")
+            for collection_id in sorted(new_ids):
+                print(f"  {collection_id}")
+            if old_ids is not None:
+                added = sorted(new_ids - old_ids)
+                removed = sorted(old_ids - new_ids)
+                print(f"  added: {', '.join(added) or '-'}")
+                print(f"  removed: {', '.join(removed) or '-'}")
+                if removed and publish and not removals_allowed:
+                    raise SystemExit(
+                        f"collections.json would drop {', '.join(removed)} from the published "
+                        "index; not published (the parquet files are uploaded). Check why "
+                        "(no parquet file or no stac-scraper template for them) and re-run "
+                        "with allow_removals=true to accept it."
+                    )
+
+            if publish:
+                upload(fs, prefix, collections_path, f"{root}/collections.json")
+                print("done: STAC index updated")
+            else:
+                print("dry run: nothing uploaded; the generated index is in the stac-index artifact")
+
+
+        if __name__ == "__main__":
+            main()

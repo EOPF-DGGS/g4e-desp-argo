@@ -100,6 +100,9 @@ s3proxy_secret_key    = "<s3proxy_secret_key>"
 The `s3proxy_access_key` / `s3proxy_secret_key` are the credentials for the `grid4earth` bucket
 served publicly via `https://data.grid4earth.eu`.
 
+The CDSE (Copernicus Data Space Ecosystem) login used by the orbit pipeline is not a Tofu
+variable: its secret is created with `kubectl`, see [CDSE credentials](#cdse-credentials).
+
 ---
 
 ## Step 5 — Initialize Tofu
@@ -436,6 +439,188 @@ Then update `argo-values.yaml` accordingly and redeploy:
 
 ```bash
 tofu apply -var-file=secrets/terraform.tfvars -target=helm_release.argo_workflows
+```
+
+---
+
+## Orbit pipeline
+
+The orbit pipeline selects all the Sentinel products of one satellite orbit (same
+`sat:absolute_orbit`) over France in the [CDSE STAC](https://stac.dataspace.copernicus.eu/v1/),
+mirrors them as EOPF Zarr (UTM) in `s3://grid4earth/public/eopf-mirror/<collection>/`, converts
+the whole orbit strip into a single HEALPix Zarr in `s3://grid4earth/public/converted/<collection>/`
+and refreshes the public STAC index with [stac-scraper](https://github.com/GRID4EARTH/stac-scraper).
+It is made of four WorkflowTemplates in `workflows/`:
+
+| WorkflowTemplate | File | Role |
+|---|---|---|
+| `cdse-orbit-to-eopf-mirror` | `workflows/cdse-orbit-to-eopf-mirror.yaml` | CDSE search of the orbit, then one pod per product (at most 4 at a time): copy from the EOPF Sample Service when it has every product of the orbit, else CDSE SAFE download and conversion to EOPF Zarr, into `eopf-mirror/` (complete stores are skipped) |
+| `healpix-convert-multistage` | `workflows/healpix-convert-multistage.yaml` | conversion of the orbit strip to one HEALPix Zarr in `converted/` (staging cache, prepare, chunk tasks, finalize) |
+| `stac-scraper-update` | `workflows/stac-scraper-update.yaml` | re-scrapes `eopf-mirror` and `converted`, uploads the parquet files then `collections.json` (public-read) |
+| `orbit-to-healpix-pipeline` | `workflows/orbit-to-healpix-pipeline.yaml` | checks the arguments and prerequisites, then chains the three templates above with `templateRef` (the STAC step only when `update_stac=true`) |
+
+The pipeline uses three images, each a workflow parameter:
+
+| Parameter | Default | Used for |
+|---|---|---|
+| `eopf_image` | `s2msi:fefecebf` | SAFE to EOPF Zarr (eopf) |
+| `healpix_image` | `g4e-jupyterhub-private:2026-10-01` | CDSE search (pystac-client) |
+| `orbit_image` | `g4e-jupyterhub-private:2026-10-10-orbit` | argument check, HEALPix conversion and STAC index (healpix-convert, legacy-converters, stac-scraper) |
+
+`orbit_image` is built from `containers/Dockerfile_private_orbit` (see `containers/.build`) and
+must be pushed before the first run. The first step of the pipeline (`check-arguments`) runs on
+it: when the image is missing its pod stays in `ImagePullBackOff` and the run fails after 15
+minutes (`activeDeadlineSeconds`), before anything is downloaded. Push the image and submit
+again. With `-p orbit_image=<...>:2026-10-01 -p update_stac=false` the pipeline runs without it,
+but the conversion then falls back to the converter bundled in the old `legacy_converters` (the
+Sentinel-2 `conditions/geometry` and `conditions/meteorology` groups stay empty) and there is no
+STAC update. Every pod has a deadline, so a pod that cannot start fails instead of waiting
+forever; `argo stop -n argo <workflow>` stops a run by hand.
+
+### CDSE credentials
+
+Downloads from CDSE need an account. The workflows read it from the `argo-cdse-credentials`
+secret (keys `username` and `password`), mounted read-only at `/etc/cdse`; it is never passed as a
+workflow parameter. It is not managed by Tofu (a `tofu apply` would otherwise need the password
+on every machine and could overwrite the secret): create it once with `kubectl`, prefixing the
+command with a space or clearing the shell history so that the password is not kept there:
+
+```bash
+ kubectl -n argo create secret generic argo-cdse-credentials \
+  --from-literal=username='<cdse_username>' \
+  --from-literal=password='<cdse_password>'
+```
+
+`check-arguments` stops the run when this secret or `argo-s3-credentials` is missing.
+
+Recommendations:
+
+- Use an account dedicated to the pipeline rather than a personal one: every workflow submitted
+  to the `argo` namespace can mount this secret.
+- A CDSE account allows 4 concurrent connections. The mirror step runs at most 4 pods at a time
+  for that reason; do not download with the same account elsewhere (for example
+  `legacy-datasets` `download_orbit.py`) while a pipeline runs. HTTP 429 / 503 answers are waited
+  out (`Retry-After`) and the access token is reused for a few minutes.
+
+### Artifacts
+
+`healpix-convert-multistage` (staging cache and task list) and `stac-scraper-update` (the
+`stac-index` output) store their artifacts at an explicit location,
+`s3://g4e-desp-argo-artifacts/<template>/<workflow uid>/`, with the `argo-s3-credentials` secret.
+They do not rely on the default artifact repository: the `artifactRepositoryRef` block of
+`argo-values.yaml` nests its key under `data:`, so the `artifact-repositories` ConfigMap rendered
+by the chart has no `default-v1-s3` key and the controller has no usable default repository
+(check with `kubectl -n argo get cm artifact-repositories -o yaml`).
+
+### Deploying and running
+
+From the repository root (the pipeline calls the other three with `templateRef`, so they must
+all be deployed):
+
+```bash
+kubectl apply -n argo \
+  -f tf/workflows/cdse-orbit-to-eopf-mirror.yaml \
+  -f tf/workflows/healpix-convert-multistage.yaml \
+  -f tf/workflows/stac-scraper-update.yaml \
+  -f tf/workflows/orbit-to-healpix-pipeline.yaml
+```
+
+Example: Sentinel-2C orbit 4025 (relative orbit 51, 13 June 2025) over France, identified by one of
+its products:
+
+```bash
+argo submit -n argo --watch \
+  --from workflowtemplate/orbit-to-healpix-pipeline \
+  -p reference_item=S2C_MSIL2A_20250613T104641_N0511_R051_T31UDQ_20250613T134507
+```
+
+The 65 products of the orbit (58 tiles; at a datatake boundary a tile can have two products, both
+are kept) are mirrored in `s3://grid4earth/public/eopf-mirror/sentinel-2-l2a/` and the HEALPix
+result is written to
+`s3://grid4earth/public/converted/sentinel-2-l2a/S2C_MSIL2A_20250613T104641_R051_O4025_FRANCE.zarr`
+(`{platform}_{type}_{first sensing start}_R{relative orbit}_O{absolute orbit}_{region}`).
+
+Main parameters of `orbit-to-healpix-pipeline` (the others are described in the template):
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `collection` | `sentinel-2-l2a` | CDSE collection (`sentinel-2-l1c`, `sentinel-2-l2a`, `sentinel-3-olci-1-efr-ntc`, `sentinel-3-sl-1-rbt-ntc`, ...) |
+| `reference_item` | | one CDSE product of the orbit; otherwise give `datetime` (and `platform`, `absolute_orbit`, `relative_orbit`), not both |
+| `bbox` | France | search area, `minx,miny,maxx,maxy` or `france` (empty = whole orbit) |
+| `region_name` | | last part of the output name; empty = `FRANCE` for the France bbox, else `REGION` |
+| `check_sample_service` | `true` | copy the products from the EOPF Sample Service when it has every product of the orbit (stores from both sources cannot be merged into one HEALPix dataset) |
+| `settings_name` | `sentinel-2-l2a` | `legacy_converters` settings, named after the G4E collection: it **must match** `collection` (empty = derived from it); the run stops at the argument check otherwise |
+| `groups` | all | JSON list of groups to convert, e.g. `'["measurements/reflectance/r60m"]'` |
+| `overwrite` | `false` | replace an existing HEALPix output |
+| `update_stac`, `stac_dry_run` | `true`, `false` | refresh the STAC index after the conversion, or only build it |
+| `stac_allow_removals` | `false` | publish `collections.json` even when it drops collections of the published one |
+
+For Sentinel-3, set `settings_name` to the G4E collection (or its `-psf` variant), e.g. for OLCI
+EFR:
+
+```bash
+argo submit -n argo --watch \
+  --from workflowtemplate/orbit-to-healpix-pipeline \
+  -p collection=sentinel-3-olci-1-efr-ntc \
+  -p settings_name=sentinel-3-olci-l1-efr \
+  -p reference_item=S3B_OL_1_EFR____20250613T111915_20250613T112215_20250614T123815_0179_107_308_2160_ESA_O_NT_004
+```
+
+which writes
+`s3://grid4earth/public/converted/sentinel-3-olci-l1-efr/S3B_OL_1_EFR_20250613T111615_R308_O37155_FRANCE.zarr`.
+
+A full Sentinel-2 orbit over France is a large job: about 52 GB of SAFE downloads for 65
+products, then tens of thousands of output chunks per 10 m group. For a first test, keep both the
+mirror and the HEALPix output in `tmp/` (never indexed), use a small area (here 2 products around
+Paris) and one group, without touching the STAC index:
+
+```bash
+argo submit -n argo --watch \
+  --from workflowtemplate/orbit-to-healpix-pipeline \
+  -p reference_item=S2C_MSIL2A_20250613T104641_N0511_R051_T31UDQ_20250613T134507 \
+  -p bbox=2.2,48.7,2.5,48.9 -p region_name=PARIS \
+  -p mirror_prefix=s3://grid4earth/public/tmp/eopf-mirror \
+  -p converted_prefix=s3://grid4earth/public/tmp/converted \
+  -p groups='["measurements/reflectance/r60m"]' \
+  -p update_stac=false
+```
+
+Behaviour worth knowing:
+
+- Re-running on the same orbit skips the products already mirrored (a store is complete when its
+  root `zarr.json` has `stac_discovery`; an incomplete one left by a failed attempt is deleted and
+  written again), but the conversion refuses an existing output unless `-p overwrite=true`. To
+  resume a run whose conversion tasks failed, use `argo retry -n argo <workflow>` (only the failed
+  tasks run again).
+- The HEALPix dataset gets its root `stac_discovery`, which makes stac-scraper index it, only in
+  the last conversion step (`finalize`), once every chunk is written; until then the item is kept
+  as `stac_discovery_pending`. With `overwrite=true` the existing dataset is deleted at the start
+  of the conversion and is not indexed again before `finalize`.
+- Groups whose inputs cannot be concatenated are left out with a warning in the `stage-cache` log:
+  for a Sentinel-2 orbit, `conditions/geometry`, whose `detector` dimension differs between full
+  and partial tiles.
+- `healpix-convert-multistage` works around three issues of healpix-convert 3aa72e0 until they
+  are fixed upstream (see the comment at the top of the template): input STAC items with
+  different `stac_extensions` are merged as a union, a chunk without any input point is left
+  empty instead of failing, and the resamplers get float64 coordinates (the float32 ones of the
+  `no_chunk` groups make them fail).
+- Objects written under `s3://grid4earth/public/` are public-read, like the rest of that area.
+- `stac-scraper-update` stops before scraping when a dataset directory has no root `zarr.json`
+  (an interrupted upload by another tool: delete it), and does not publish a `collections.json`
+  that drops published collections unless `allow_removals=true` (`stac_allow_removals=true` in the
+  pipeline). The first update with stac-scraper 62b5c01 drops `converted-sentinel-3-synergy`,
+  whose parquet file no longer exists: check it with `stac_dry_run=true`, then allow it once.
+  stac-scraper has no collection template for `sentinel-3-slstr-l2-frp` and
+  `sentinel-3-slstr-l2-lst`: their items are scraped but these collections are not listed in
+  `collections.json`.
+
+The STAC index can also be refreshed on its own. With `dry_run=true` nothing is uploaded and the
+generated index is kept as the `stac-index` output artifact:
+
+```bash
+argo submit -n argo --watch \
+  --from workflowtemplate/stac-scraper-update \
+  -p dry_run=true
 ```
 
 ---

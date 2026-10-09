@@ -1,0 +1,1590 @@
+# Multi-stage conversion of EOPF Zarr product(s) into ONE HEALPix Zarr dataset
+# (GRID4EARTH/legacy-datasets#8). Argo runs the stages and retries what fails:
+#
+#   stage-cache     validates the arguments, refuses an existing output (unless
+#                   overwrite=true), runs create_staging_cache once, drops the groups
+#                   that cannot be merged (see below), publishes the cache (artifact
+#                   'cache') and splits every spatial group's output chunks into
+#                   tasks (parameter 'tasks', artifact 'tasks').
+#   prepare         prepare_healpix_dataset: creates the output Zarr dataset with all
+#                   groups, arrays and metadata but no resampled data yet. Its root
+#                   STAC item is stored as 'stac_discovery_pending', so stac-scraper
+#                   does not index the dataset before it is complete.
+#   convert-chunks  convert_group_to_healpix(group, chunk_indices=...) for each task,
+#                   one pod per task, at most `parallelism` pods at a time.
+#   finalize        checks that every chunk of each dense group was written, then
+#                   publishes the root 'stac_discovery' and consolidates the metadata.
+#
+# Tasks: 'tasks' is a JSON list of {"group": "<group path>", "chunk_indices": "<JSON>"}.
+# chunk_indices is a JSON list whose items are chunk indices or [start, stop)
+# ranges; stage-cache writes one range per task, e.g. "[[0,16]]". Batches hold
+# chunks_per_task chunks, raised as needed so that there are at most max_tasks
+# tasks (one S2 orbit over France has ~30000 chunks per 10 m group; Argo cannot
+# keep tens of thousands of nodes in one workflow).
+#
+# Groups that cannot be merged: healpix-convert concatenates the inputs of a group,
+# which fails when a non-spatial dimension has different sizes in different inputs
+# (Sentinel-2 conditions/geometry: 'detector' is 6 in a full tile and 1 in a tile at
+# the edge of the swath). stage-cache leaves such groups out with a WARNING and
+# passes the remaining groups to prepare (output parameter 'groups').
+#
+# Workarounds for healpix-convert 3aa72e0 (and the converter bundled in
+# legacy_converters de458eb), to remove once fixed upstream:
+#   - prepare merges list-valued STAC fields (stac_extensions) of the inputs as a
+#     union instead of failing on stores written by different eopf versions;
+#   - convert-chunk treats a chunk with 0 input points (a buffered chunk polygon
+#     grazing a tile) as a chunk without input instead of failing in the resampler;
+#   - convert-chunk gives the resamplers float64 longitudes / latitudes (the no_chunk
+#     groups, e.g. Sentinel-2 conditions/meteorology, store them as float32, which
+#     makes the resampler fail).
+#
+# Parallelism: Argo does not template `parallelism` (an integer field). The tasks
+# are therefore dealt round-robin into `parallelism` lanes; each lane is a steps
+# template with parallelism 1 that runs its tasks one after another.
+#
+# Overwrite and retries: prepare opens the output in mode "w", which deletes
+# whatever is there, so the existing-output check is done once, in stage-cache,
+# before anything is written. prepare runs only after that check, and the chunk
+# tasks only after prepare succeeded, so a retry of prepare (retryStrategy or
+# `argo retry` of a failed run) can only wipe its own partial output, never data
+# written by chunk tasks. With overwrite=true the existing (published) dataset is
+# deleted by prepare and only re-published by finalize. Exit code 3 of stage-cache
+# (output exists) and exit code 2 (invalid arguments, incomplete output) are not
+# retried. To resume after failed chunk tasks use `argo retry <workflow>` (only the
+# failed tasks run again); submitting a new workflow on the same output_path fails
+# in stage-cache unless overwrite=true, which starts from scratch.
+#
+# Artifacts: 'cache' and 'tasks' are stored at an explicit S3 location
+# (s3://g4e-desp-argo-artifacts/healpix-convert-multistage/<workflow uid>/), so the
+# template does not depend on the default artifact repository of the controller.
+#
+# The DAG template 'main' takes every argument as an input parameter (only
+# input_paths and output_path have no default) and exposes output_path and
+# stac_item_id, so another WorkflowTemplate can call it with
+# templateRef {name: healpix-convert-multistage, template: main}. Volumes are
+# declared per template; the calling workflow must use serviceAccountName
+# argo-workflow and imagePullSecrets harbor-pull-secret.
+#
+# Secret: argo-s3-credentials (accessKey, secretKey), mounted at /etc/s3.
+# healpix_convert opens the inputs with xr.open_datatree(path) and no storage
+# options, so every pod sets fsspec.config.conf["s3"] (honoured by every
+# S3FileSystem) and AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_ENDPOINT_URL
+# (inherited by the dask worker processes) before opening anything. Objects
+# written under s3://grid4earth/public/ get the public-read ACL.
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: healpix-convert-multistage
+  namespace: argo
+spec:
+  entrypoint: main
+  serviceAccountName: argo-workflow
+  imagePullSecrets:
+    - name: harbor-pull-secret
+  arguments:
+    parameters:
+      - name: input_paths
+        value: "[]"
+        description: JSON list of input EOPF Zarr paths (s3://..., https://... or local)
+      - name: output_path
+        value: ""
+        description: output HEALPix Zarr path, e.g. s3://grid4earth/public/converted/sentinel-2-l2a/S2C_MSIL2A_20250613T104641_R051_O4025_FRANCE.zarr
+      - name: settings_name
+        value: sentinel-2-l2a
+        description: legacy_converters get_settings() name, or an inline JSON ConvertSettings document
+      - name: groups
+        value: ""
+        description: empty = all groups, else a JSON list of input group paths (or a JSON string glob pattern)
+      - name: chunks_per_task
+        value: "16"
+        description: chunks converted by one pod (raised automatically to respect max_tasks)
+      - name: max_tasks
+        value: "500"
+        description: upper bound on the number of chunk tasks (pods) in the workflow
+      - name: parallelism
+        value: "8"
+        description: number of chunk tasks running at the same time
+      - name: overwrite
+        value: "false"
+        enum: ["true", "false"]
+        description: replace an existing output dataset
+      - name: nworkers
+        value: "4"
+        description: dask workers per chunk pod (1 = no dask cluster)
+      - name: s3_endpoint
+        value: https://s3.gra.io.cloud.ovh.net
+      - name: healpix_image
+        value: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-01
+  templates:
+  - name: main
+    inputs:
+      parameters:
+        - name: input_paths
+        - name: output_path
+        - name: settings_name
+          default: sentinel-2-l2a
+        - name: groups
+          default: ""
+        - name: chunks_per_task
+          default: "16"
+        - name: max_tasks
+          default: "500"
+        - name: parallelism
+          default: "8"
+        - name: overwrite
+          default: "false"
+        - name: nworkers
+          default: "4"
+        - name: s3_endpoint
+          default: https://s3.gra.io.cloud.ovh.net
+        - name: healpix_image
+          default: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-01
+    outputs:
+      parameters:
+        - name: output_path
+          valueFrom:
+            parameter: "{{tasks.finalize.outputs.parameters.output_path}}"
+        - name: stac_item_id
+          valueFrom:
+            parameter: "{{tasks.finalize.outputs.parameters.stac_item_id}}"
+    dag:
+      tasks:
+        - name: stage-cache
+          template: stage-cache
+          arguments:
+            parameters:
+              - name: input_paths
+                value: "{{inputs.parameters.input_paths}}"
+              - name: output_path
+                value: "{{inputs.parameters.output_path}}"
+              - name: settings_name
+                value: "{{inputs.parameters.settings_name}}"
+              - name: groups
+                value: "{{inputs.parameters.groups}}"
+              - name: chunks_per_task
+                value: "{{inputs.parameters.chunks_per_task}}"
+              - name: max_tasks
+                value: "{{inputs.parameters.max_tasks}}"
+              - name: parallelism
+                value: "{{inputs.parameters.parallelism}}"
+              - name: overwrite
+                value: "{{inputs.parameters.overwrite}}"
+              - name: nworkers
+                value: "{{inputs.parameters.nworkers}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+        - name: prepare
+          depends: stage-cache
+          template: prepare
+          arguments:
+            parameters:
+              - name: output_path
+                value: "{{inputs.parameters.output_path}}"
+              - name: settings_name
+                value: "{{inputs.parameters.settings_name}}"
+              # the groups kept by stage-cache (same selection as the cache)
+              - name: groups
+                value: "{{tasks.stage-cache.outputs.parameters.groups}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+            artifacts:
+              - name: cache
+                from: "{{tasks.stage-cache.outputs.artifacts.cache}}"
+        - name: convert-chunks
+          depends: prepare
+          template: convert-lane
+          withParam: "{{tasks.stage-cache.outputs.parameters.lanes}}"
+          arguments:
+            parameters:
+              - name: lane
+                value: "{{item}}"
+              - name: n_lanes
+                value: "{{tasks.stage-cache.outputs.parameters.n_lanes}}"
+              - name: output_path
+                value: "{{inputs.parameters.output_path}}"
+              - name: settings_name
+                value: "{{inputs.parameters.settings_name}}"
+              - name: nworkers
+                value: "{{inputs.parameters.nworkers}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+            artifacts:
+              - name: cache
+                from: "{{tasks.stage-cache.outputs.artifacts.cache}}"
+              - name: tasks
+                from: "{{tasks.stage-cache.outputs.artifacts.tasks}}"
+        - name: finalize
+          depends: convert-chunks
+          template: finalize
+          arguments:
+            parameters:
+              - name: output_path
+                value: "{{inputs.parameters.output_path}}"
+              - name: settings_name
+                value: "{{inputs.parameters.settings_name}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+            artifacts:
+              - name: cache
+                from: "{{tasks.stage-cache.outputs.artifacts.cache}}"
+
+  # One lane: its share of the tasks, one pod after the other. failFast false keeps
+  # the lane going after a task failed for good (the lane, hence the run, still
+  # ends Failed and `argo retry` re-runs only the failed tasks).
+  - name: convert-lane
+    parallelism: 1
+    failFast: false
+    inputs:
+      parameters:
+        - name: lane
+        - name: n_lanes
+        - name: output_path
+        - name: settings_name
+        - name: nworkers
+        - name: s3_endpoint
+        - name: healpix_image
+      artifacts:
+        - name: cache
+        - name: tasks
+    steps:
+      - - name: lane-tasks
+          template: lane-tasks
+          arguments:
+            parameters:
+              - name: lane
+                value: "{{inputs.parameters.lane}}"
+              - name: n_lanes
+                value: "{{inputs.parameters.n_lanes}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+            artifacts:
+              - name: tasks
+                from: "{{inputs.artifacts.tasks}}"
+      - - name: convert-chunk
+          template: convert-chunk
+          withParam: "{{steps.lane-tasks.outputs.parameters.tasks}}"
+          arguments:
+            parameters:
+              - name: group
+                value: "{{item.group}}"
+              - name: chunk_indices
+                value: "{{item.chunk_indices}}"
+              - name: output_path
+                value: "{{inputs.parameters.output_path}}"
+              - name: settings_name
+                value: "{{inputs.parameters.settings_name}}"
+              - name: nworkers
+                value: "{{inputs.parameters.nworkers}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+            artifacts:
+              - name: cache
+                from: "{{inputs.artifacts.cache}}"
+
+  - name: stage-cache
+    retryStrategy:
+      limit: "2"
+      retryPolicy: Always
+      # exit code 3 = the output already exists, 2 = invalid arguments: retrying cannot help
+      expression: 'lastRetry.exitCode != "3" && lastRetry.exitCode != "2"'
+      backoff:
+        duration: "30s"
+        factor: "2"
+    # per attempt; also bounds a pod stuck in Pending (ImagePullBackOff)
+    activeDeadlineSeconds: 7200
+    inputs:
+      parameters:
+        - name: input_paths
+        - name: output_path
+        - name: settings_name
+        - name: groups
+        - name: chunks_per_task
+        - name: max_tasks
+        - name: parallelism
+        - name: overwrite
+        - name: nworkers
+        - name: s3_endpoint
+        - name: healpix_image
+    outputs:
+      parameters:
+        - name: tasks
+          valueFrom:
+            path: /tmp/out/tasks.json
+        - name: lanes
+          valueFrom:
+            path: /tmp/out/lanes.json
+        - name: n_lanes
+          valueFrom:
+            path: /tmp/out/n_lanes
+        - name: n_tasks
+          valueFrom:
+            path: /tmp/out/n_tasks
+        - name: n_chunks
+          valueFrom:
+            path: /tmp/out/n_chunks
+        - name: groups
+          valueFrom:
+            path: /tmp/out/groups
+      artifacts:
+        # explicit location: the default artifact repository is not relied upon
+        - name: cache
+          path: /tmp/out/cache.json
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.gra.io.cloud.ovh.net
+            region: gra
+            insecure: false
+            bucket: g4e-desp-argo-artifacts
+            key: "healpix-convert-multistage/{{workflow.uid}}/cache.json"
+            accessKeySecret:
+              name: argo-s3-credentials
+              key: accessKey
+            secretKeySecret:
+              name: argo-s3-credentials
+              key: secretKey
+        - name: tasks
+          path: /tmp/out/tasks.json
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.gra.io.cloud.ovh.net
+            region: gra
+            insecure: false
+            bucket: g4e-desp-argo-artifacts
+            key: "healpix-convert-multistage/{{workflow.uid}}/tasks.json"
+            accessKeySecret:
+              name: argo-s3-credentials
+              key: accessKey
+            secretKeySecret:
+              name: argo-s3-credentials
+              key: secretKey
+    volumes:
+      - name: s3-creds
+        secret:
+          secretName: argo-s3-credentials
+    script:
+      image: "{{inputs.parameters.healpix_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+        limits:
+          cpu: "2"
+          memory: 8Gi
+      volumeMounts:
+        - name: s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+      source: |
+        # Argo parameters (substituted by Argo before the script runs)
+        input_paths = r'''{{inputs.parameters.input_paths}}'''
+        output_path = "{{inputs.parameters.output_path}}"
+        settings_name = r'''{{inputs.parameters.settings_name}}'''
+        groups = r'''{{inputs.parameters.groups}}'''
+        chunks_per_task = "{{inputs.parameters.chunks_per_task}}"
+        max_tasks = "{{inputs.parameters.max_tasks}}"
+        parallelism = "{{inputs.parameters.parallelism}}"
+        overwrite = "{{inputs.parameters.overwrite}}"
+        nworkers = "{{inputs.parameters.nworkers}}"
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        import json
+        import math
+        import os
+        import sys
+        import types
+
+        S3_CREDS_DIR = "/etc/s3"
+        OUT_DIR = "/tmp/out"
+        PUBLIC_READ_PREFIXES = ("s3://grid4earth/public/",)
+        EXIT_INVALID = 2
+        EXIT_OUTPUT_EXISTS = 3
+
+
+        def fail(message, code=EXIT_INVALID):
+            print(f"ERROR: {message}", flush=True)
+            sys.exit(code)
+
+
+        def read_s3_credentials():
+            """(key, secret) from the mounted secret, or None when it is not mounted."""
+            key_file = os.path.join(S3_CREDS_DIR, "accessKey")
+            secret_file = os.path.join(S3_CREDS_DIR, "secretKey")
+            if not (os.path.isfile(key_file) and os.path.isfile(secret_file)):
+                return None
+            with open(key_file) as f:
+                key = f.read().strip()
+            with open(secret_file) as f:
+                secret = f.read().strip()
+            return key, secret
+
+
+        def configure_s3(endpoint):
+            """Let s3:// paths opened without storage options use the cluster credentials.
+
+            Returns the storage options for explicit S3 access, or None without credentials.
+            """
+            creds = read_s3_credentials()
+            if creds is None:
+                print(f"no S3 credentials in {S3_CREDS_DIR}: s3:// paths are not accessible")
+                return None
+            key, secret = creds
+            os.environ["AWS_ACCESS_KEY_ID"] = key
+            os.environ["AWS_SECRET_ACCESS_KEY"] = secret
+            if endpoint:
+                os.environ["AWS_ENDPOINT_URL"] = endpoint
+            import fsspec.config
+
+            options = {"key": key, "secret": secret}
+            if endpoint:
+                options["client_kwargs"] = {"endpoint_url": endpoint}
+            fsspec.config.conf["s3"] = json.loads(json.dumps(options))
+            return options
+
+
+        def storage_options_for(url, s3_options):
+            if not url.startswith("s3://"):
+                return None
+            if s3_options is None:
+                fail(f"{url} needs S3 credentials in {S3_CREDS_DIR}", 1)
+            options = json.loads(json.dumps(s3_options))
+            if url.startswith(PUBLIC_READ_PREFIXES):
+                options["s3_additional_kwargs"] = {"ACL": "public-read"}
+            return options
+
+
+        def import_api():
+            try:
+                from healpix_convert import ConvertSettings, create_staging_cache
+                from healpix_convert.healpix_converters import init_converter
+                from legacy_converters import get_settings
+                import healpix_convert as package
+            except ImportError:
+                # image with the old legacy_converters that bundles the converter
+                from legacy_converters import ConvertSettings, create_staging_cache, get_settings
+                from legacy_converters.healpix_converters import init_converter
+                import legacy_converters as package
+            print(f"converter: {package.__name__} {getattr(package, '__version__', '?')}")
+            return types.SimpleNamespace(
+                ConvertSettings=ConvertSettings,
+                create_staging_cache=create_staging_cache,
+                get_settings=get_settings,
+                init_converter=init_converter,
+            )
+
+
+        def resolve_settings(api, name):
+            text = name.strip()
+            try:
+                if text.startswith("{"):
+                    settings = api.ConvertSettings.model_validate_json(text)
+                else:
+                    settings = api.get_settings(text)
+            except Exception as exc:
+                fail(f"invalid settings_name {text[:80]!r}: {type(exc).__name__}: {exc}")
+            if not isinstance(settings, api.ConvertSettings):
+                settings = api.ConvertSettings.model_validate(settings.model_dump())
+            return settings
+
+
+        def parse_groups(text):
+            """None (all groups), a glob pattern, or a list of absolute group paths."""
+            text = text.strip()
+            if not text:
+                return None
+            try:
+                value = json.loads(text)
+            except ValueError:
+                value = None
+            if isinstance(value, str):
+                return value
+            if not value or not isinstance(value, list) or not all(isinstance(g, str) for g in value):
+                fail(f"groups must be empty, a JSON list of group paths or a JSON string: {text}")
+            return ["/" + g.strip("/") for g in value]
+
+
+        def parse_positive_int(name, text):
+            try:
+                value = int(text)
+            except ValueError:
+                value = 0
+            if value < 1:
+                fail(f"{name} must be a positive integer, got {text!r}")
+            return value
+
+
+        def parse_bool(name, text):
+            value = text.strip().lower()
+            if value not in ("true", "false"):
+                fail(f"{name} must be 'true' or 'false', got {text!r}")
+            return value == "true"
+
+
+        def output_exists(url, storage_options):
+            import fsspec.core
+
+            fs, path = fsspec.core.url_to_fs(url, **(storage_options or {}))
+            return fs.exists(path)
+
+
+        def unmergeable_groups(cache):
+            """{group: {dim: sizes}} for the spatial groups with a non-spatial dimension
+            whose size differs between the inputs (healpix-convert concatenates them)."""
+            trees = list(cache.input_datatrees.values())
+            problems = {}
+            if len(trees) < 2:
+                return problems
+            for group_path, info in cache.input_spatial_groups.items():
+                spatial = getattr(info, "spatial_dimensions", None)
+                if spatial is None:
+                    print("note: no spatial_dimensions in the cache, dimension check skipped")
+                    return {}
+                path = str(group_path).strip("/")
+                sizes = {}
+                for tree in trees:
+                    node = tree if path in ("", ".") else tree[path]
+                    for dim, size in node.dataset.sizes.items():
+                        if dim not in spatial:
+                            sizes.setdefault(dim, set()).add(int(size))
+                bad = {dim: sorted(values) for dim, values in sizes.items() if len(values) > 1}
+                if bad:
+                    problems[group_path] = bad
+            return problems
+
+
+        def count_chunks(api, cache, settings, group_path):
+            """Number of output chunks of a spatial group (the bound used by convert_group_to_healpix)."""
+            if settings.group_settings[group_path].chunk.method == "no_chunk":
+                # converted in one piece, chunk_indices are ignored
+                return 1
+            import zarr
+
+            converter = api.init_converter(
+                group_path, cache=cache, settings=settings, output_store=zarr.storage.MemoryStore()
+            )
+            return int(math.ceil(converter.cell_dim_size / converter.cell_dim_chunk_size))
+
+
+        def batch_size(chunk_counts, minimum, limit):
+            """Smallest batch size >= minimum giving at most `limit` tasks (if possible)."""
+
+            def n_tasks(size):
+                return sum(math.ceil(n / size) for n in chunk_counts)
+
+            low, high = minimum, max(minimum, max(chunk_counts))
+            if n_tasks(low) <= limit:
+                return low
+            while low < high:
+                middle = (low + high) // 2
+                if n_tasks(middle) <= limit:
+                    high = middle
+                else:
+                    low = middle + 1
+            return low
+
+
+        def write_text(name, text):
+            with open(os.path.join(OUT_DIR, name), "w") as f:
+                f.write(text)
+
+
+        def main():
+            try:
+                paths = json.loads(input_paths) if input_paths.strip() else []
+            except ValueError:
+                paths = None
+            if not paths or not isinstance(paths, list) or not all(isinstance(p, str) and p for p in paths):
+                fail(f"input_paths must be a non-empty JSON list of paths, got {input_paths!r}")
+            if not output_path.strip():
+                fail("output_path is empty")
+            selected_groups = parse_groups(groups)
+            min_batch = parse_positive_int("chunks_per_task", chunks_per_task)
+            task_limit = parse_positive_int("max_tasks", max_tasks)
+            max_lanes = parse_positive_int("parallelism", parallelism)
+            parse_positive_int("nworkers", nworkers)  # used by convert-chunk, checked here
+            replace = parse_bool("overwrite", overwrite)
+            os.makedirs(OUT_DIR, exist_ok=True)
+
+            s3_options = configure_s3(s3_endpoint)
+            output_options = storage_options_for(output_path, s3_options)
+
+            # The only existing-output check of the workflow (see prepare).
+            if output_exists(output_path, output_options):
+                if not replace:
+                    fail(
+                        f"output {output_path} already exists. Set overwrite=true to rebuild it "
+                        "from scratch, or use `argo retry` on the workflow that created it to "
+                        "re-run only its failed steps.",
+                        EXIT_OUTPUT_EXISTS,
+                    )
+                print(f"WARNING: {output_path} exists and will be replaced (overwrite=true)")
+
+            api = import_api()
+            settings = resolve_settings(api, settings_name)
+            print(f"{len(paths)} input dataset(s), groups: {selected_groups or 'all'}")
+            cache = api.create_staging_cache(paths, settings, groups=selected_groups)
+            if not cache.input_spatial_groups:
+                fail("no spatial group to convert to HEALPix in the input dataset(s)")
+
+            groups_out = groups.strip()
+            problems = unmergeable_groups(cache)
+            if problems:
+                for group_path, dims in problems.items():
+                    print(f"WARNING: group /{group_path} left out: dimension sizes differ "
+                          f"between the inputs {dims}")
+                dropped = {"/" + str(p).strip("/") for p in problems}
+                first = next(iter(cache.input_datatrees.values()))
+                kept = [node.path for node in first.subtree
+                        if not any(node.path == d or node.path.startswith(d + "/") for d in dropped)]
+                if not any(path != "/" for path in kept):
+                    fail("no group left to convert")
+                cache = api.create_staging_cache(paths, settings, groups=kept)
+                if not cache.input_spatial_groups:
+                    fail("no spatial group left to convert to HEALPix")
+                groups_out = json.dumps(kept, separators=(",", ":"))
+            write_text("cache.json", cache.to_json())
+            write_text("groups", groups_out)
+
+            # keys are PurePath, like those of settings.group_settings
+            chunk_counts = {}
+            for group_path in cache.input_spatial_groups:
+                chunk_counts[group_path] = count_chunks(api, cache, settings, group_path)
+
+            size = batch_size(list(chunk_counts.values()), min_batch, task_limit)
+            if size != min_batch:
+                print(f"chunks_per_task raised from {min_batch} to {size} to stay within max_tasks={task_limit}")
+            tasks = []
+            for group_path, n_chunks in chunk_counts.items():
+                for start in range(0, n_chunks, size):
+                    stop = min(start + size, n_chunks)
+                    chunk_indices = json.dumps([[start, stop]], separators=(",", ":"))
+                    tasks.append({"group": str(group_path), "chunk_indices": chunk_indices})
+            if len(tasks) > task_limit:
+                print(f"WARNING: {len(tasks)} tasks (one per group) exceed max_tasks={task_limit}")
+            n_lanes = min(max_lanes, len(tasks))
+
+            total = sum(chunk_counts.values())
+            print(f"{len(chunk_counts)} spatial group(s), {total} chunk(s), {len(tasks)} task(s) "
+                  f"of up to {size} chunk(s), {n_lanes} lane(s) in parallel:")
+            for group_path, n_chunks in chunk_counts.items():
+                method = settings.group_settings[group_path].chunk.method
+                print(f"  - {group_path}: {n_chunks} chunk(s) ({method})")
+
+            write_text("tasks.json", json.dumps(tasks, separators=(",", ":")))
+            write_text("lanes.json", json.dumps(list(range(n_lanes))))
+            write_text("n_lanes", str(n_lanes))
+            write_text("n_tasks", str(len(tasks)))
+            write_text("n_chunks", str(total))
+
+
+        if __name__ == "__main__":
+            main()
+
+  - name: prepare
+    retryStrategy:
+      limit: "2"
+      retryPolicy: Always
+      backoff:
+        duration: "30s"
+        factor: "2"
+    activeDeadlineSeconds: 7200
+    inputs:
+      parameters:
+        - name: output_path
+        - name: settings_name
+        - name: groups
+        - name: s3_endpoint
+        - name: healpix_image
+      artifacts:
+        - name: cache
+          path: /tmp/in/cache.json
+    volumes:
+      - name: s3-creds
+        secret:
+          secretName: argo-s3-credentials
+    script:
+      image: "{{inputs.parameters.healpix_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+        limits:
+          cpu: "2"
+          memory: 8Gi
+      volumeMounts:
+        - name: s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+      source: |
+        # Argo parameters (substituted by Argo before the script runs)
+        output_path = "{{inputs.parameters.output_path}}"
+        settings_name = r'''{{inputs.parameters.settings_name}}'''
+        groups = r'''{{inputs.parameters.groups}}'''
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        import importlib
+        import json
+        import os
+        import sys
+        import types
+        from datetime import datetime
+
+        S3_CREDS_DIR = "/etc/s3"
+        CACHE_FILE = "/tmp/in/cache.json"
+        PUBLIC_READ_PREFIXES = ("s3://grid4earth/public/",)
+        # finalize renames it to stac_discovery once every chunk is written
+        PENDING_STAC_KEY = "stac_discovery_pending"
+
+
+        def fail(message, code=1):
+            print(f"ERROR: {message}", flush=True)
+            sys.exit(code)
+
+
+        def read_s3_credentials():
+            """(key, secret) from the mounted secret, or None when it is not mounted."""
+            key_file = os.path.join(S3_CREDS_DIR, "accessKey")
+            secret_file = os.path.join(S3_CREDS_DIR, "secretKey")
+            if not (os.path.isfile(key_file) and os.path.isfile(secret_file)):
+                return None
+            with open(key_file) as f:
+                key = f.read().strip()
+            with open(secret_file) as f:
+                secret = f.read().strip()
+            return key, secret
+
+
+        def configure_s3(endpoint):
+            """Let s3:// paths opened without storage options use the cluster credentials.
+
+            Returns the storage options for explicit S3 access, or None without credentials.
+            """
+            creds = read_s3_credentials()
+            if creds is None:
+                print(f"no S3 credentials in {S3_CREDS_DIR}: s3:// paths are not accessible")
+                return None
+            key, secret = creds
+            os.environ["AWS_ACCESS_KEY_ID"] = key
+            os.environ["AWS_SECRET_ACCESS_KEY"] = secret
+            if endpoint:
+                os.environ["AWS_ENDPOINT_URL"] = endpoint
+            import fsspec.config
+
+            options = {"key": key, "secret": secret}
+            if endpoint:
+                options["client_kwargs"] = {"endpoint_url": endpoint}
+            fsspec.config.conf["s3"] = json.loads(json.dumps(options))
+            return options
+
+
+        def storage_options_for(url, s3_options):
+            if not url.startswith("s3://"):
+                return None
+            if s3_options is None:
+                fail(f"{url} needs S3 credentials in {S3_CREDS_DIR}")
+            options = json.loads(json.dumps(s3_options))
+            if url.startswith(PUBLIC_READ_PREFIXES):
+                options["s3_additional_kwargs"] = {"ACL": "public-read"}
+            return options
+
+
+        def import_api():
+            try:
+                from healpix_convert import ConvertSettings, ConvertStagingCache, prepare_healpix_dataset
+                from legacy_converters import get_settings
+                import healpix_convert as package
+            except ImportError:
+                from legacy_converters import (
+                    ConvertSettings,
+                    ConvertStagingCache,
+                    get_settings,
+                    prepare_healpix_dataset,
+                )
+                import legacy_converters as package
+            print(f"converter: {package.__name__} {getattr(package, '__version__', '?')}")
+            return types.SimpleNamespace(
+                ConvertSettings=ConvertSettings,
+                ConvertStagingCache=ConvertStagingCache,
+                get_settings=get_settings,
+                prepare_healpix_dataset=prepare_healpix_dataset,
+            )
+
+
+        def resolve_settings(api, name):
+            text = name.strip()
+            if text.startswith("{"):
+                settings = api.ConvertSettings.model_validate_json(text)
+            else:
+                settings = api.get_settings(text)
+            if not isinstance(settings, api.ConvertSettings):
+                settings = api.ConvertSettings.model_validate(settings.model_dump())
+            return settings
+
+
+        def parse_groups(text):
+            """None (all groups), a glob pattern, or a list of absolute group paths."""
+            text = text.strip()
+            if not text:
+                return None
+            value = json.loads(text)
+            if isinstance(value, str):
+                return value
+            return ["/" + g.strip("/") for g in value]
+
+
+        def restrict_to_groups(cache, selected_groups):
+            """Re-apply the group selection of create_staging_cache.
+
+            ConvertStagingCache.from_json re-opens the input datasets in full, but
+            prepare_healpix_dataset looks up every group of the first input in
+            cache.output_groups.io_path_map, which only knows the selected groups.
+            Same filtering as healpix_convert.cache._check_and_filter_input_groups.
+            """
+            if selected_groups is None:
+                return cache
+            paths = list(cache.input_datatrees)
+            trees = list(cache.input_datatrees.values())
+            if isinstance(selected_groups, str):
+                selection = trees[0].match(selected_groups)
+            else:
+                selection = trees[0].filter(lambda node: node.path in selected_groups)
+            cache.input_datatrees = {p: t.filter_like(selection) for p, t in zip(paths, trees)}
+            return cache
+
+
+        def merge_stac_lists_as_union():
+            """healpix-convert merges the inputs' root STAC items and fails on any
+            difference outside id/bbox/geometry/properties/links/assets, but stores
+            written by different eopf versions (or the EOPF Sample Service) list
+            different stac_extensions. Merge list values as an ordered union instead."""
+            for name in ("healpix_convert.stac_operations", "legacy_converters.stac_operations"):
+                try:
+                    module = importlib.import_module(name)
+                except ImportError:
+                    continue
+                original = getattr(module, "_merge_no_conflicts", None)
+                if original is None or getattr(original, "g4e_patched", False):
+                    continue
+
+                def merge(values, original=original):
+                    if values and all(isinstance(v, list) for v in values):
+                        merged = []
+                        for value in values:
+                            for entry in value:
+                                if entry not in merged:
+                                    merged.append(entry)
+                        return merged
+                    return original(values)
+
+                merge.g4e_patched = True
+                module._merge_no_conflicts = merge
+
+
+        def parse_time(text):
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+        def orbit_properties(properties, input_items):
+            """Properties of the merged item: healpix-convert keeps those of the first
+            input. Give it the time range of all inputs and drop the first input's
+            projection (proj:*), which does not describe the HEALPix grid."""
+            properties = {k: v for k, v in properties.items() if not k.startswith("proj:")}
+            starts, ends = [], []
+            for item in input_items:
+                p = (item or {}).get("properties") or {}
+                start = p.get("start_datetime") or p.get("datetime")
+                end = p.get("end_datetime") or p.get("datetime")
+                if start:
+                    starts.append(start)
+                if end:
+                    ends.append(end)
+            try:
+                if starts and ends:
+                    start, end = min(starts, key=parse_time), max(ends, key=parse_time)
+                    properties["start_datetime"] = start
+                    properties["end_datetime"] = end
+                    if properties.get("datetime"):
+                        properties["datetime"] = start
+            except ValueError as exc:
+                print(f"WARNING: time range not updated ({exc})")
+            return properties
+
+
+        def put_attrs(group, attrs):
+            if hasattr(group.attrs, "put"):
+                group.attrs.put(attrs)
+            else:
+                for key in [k for k in group.attrs if k not in attrs]:
+                    del group.attrs[key]
+                group.attrs.update(attrs)
+
+
+        def hold_back_stac(output_options, cache):
+            """stac_discovery -> PENDING_STAC_KEY (stac-scraper indexes every store whose
+            root has stac_discovery; this one has no data yet), with orbit properties."""
+            import zarr
+
+            root = zarr.open_group(output_path, mode="r+", storage_options=output_options)
+            attrs = dict(root.attrs)
+            item = attrs.pop("stac_discovery", None)
+            if not isinstance(item, dict):
+                fail("prepare_healpix_dataset wrote no stac_discovery")
+            inputs = [tree.attrs.get("stac_discovery") for tree in cache.input_datatrees.values()]
+            item["properties"] = orbit_properties(item.get("properties") or {}, inputs)
+            attrs[PENDING_STAC_KEY] = item
+            put_attrs(root, attrs)
+            zarr.consolidate_metadata(root.store)
+            props = item["properties"]
+            print(f"STAC item {item.get('id')} held back until finalize: "
+                  f"{props.get('start_datetime')} / {props.get('end_datetime')}")
+
+
+        def main():
+            s3_options = configure_s3(s3_endpoint)
+            output_options = storage_options_for(output_path, s3_options)
+
+            api = import_api()
+            merge_stac_lists_as_union()
+            settings = resolve_settings(api, settings_name)
+            with open(CACHE_FILE) as f:
+                cache = api.ConvertStagingCache.from_json(f.read())
+            cache = restrict_to_groups(cache, parse_groups(groups))
+
+            # No existing-output check here: stage-cache checked it before anything was
+            # written, and chunk tasks only start once prepare succeeded, so whatever is
+            # at output_path now was left by a failed attempt of this step. Mode "w"
+            # inside prepare_healpix_dataset deletes it.
+            print(f"creating {output_path} from {len(cache.input_datatrees)} input dataset(s)")
+            tree = api.prepare_healpix_dataset(
+                cache, settings, output_path, output_storage_options=output_options
+            )
+            print(f"prepared {len(tree.groups)} group(s):")
+            for path in tree.groups:
+                node = tree[path]
+                if node.data_vars:
+                    print(f"  - {path}: {dict(node.sizes)} {sorted(node.data_vars)}")
+            hold_back_stac(output_options, cache)
+
+
+        if __name__ == "__main__":
+            main()
+
+  - name: lane-tasks
+    retryStrategy:
+      limit: "3"
+      retryPolicy: Always
+      backoff:
+        duration: "10s"
+        factor: "2"
+    activeDeadlineSeconds: 900
+    inputs:
+      parameters:
+        - name: lane
+        - name: n_lanes
+        - name: healpix_image
+      artifacts:
+        - name: tasks
+          path: /tmp/in/tasks.json
+    outputs:
+      parameters:
+        - name: tasks
+          valueFrom:
+            path: /tmp/out/lane_tasks.json
+    script:
+      image: "{{inputs.parameters.healpix_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      source: |
+        # Argo parameters (substituted by Argo before the script runs)
+        lane = "{{inputs.parameters.lane}}"
+        n_lanes = "{{inputs.parameters.n_lanes}}"
+
+        import json
+        import os
+
+        TASKS_FILE = "/tmp/in/tasks.json"
+        OUT_DIR = "/tmp/out"
+
+
+        def main():
+            with open(TASKS_FILE) as f:
+                tasks = json.load(f)
+            mine = tasks[int(lane)::int(n_lanes)]
+            os.makedirs(OUT_DIR, exist_ok=True)
+            with open(os.path.join(OUT_DIR, "lane_tasks.json"), "w") as f:
+                json.dump(mine, f, separators=(",", ":"))
+            print(f"lane {lane}/{n_lanes}: {len(mine)} of {len(tasks)} task(s)")
+
+
+        if __name__ == "__main__":
+            main()
+
+  - name: convert-chunk
+    retryStrategy:
+      limit: "3"
+      retryPolicy: Always
+      # exit code 2 = invalid arguments: retrying cannot help
+      expression: 'lastRetry.exitCode != "2"'
+      backoff:
+        duration: "30s"
+        factor: "2"
+    # per attempt; also bounds a pod stuck in Pending (ImagePullBackOff)
+    activeDeadlineSeconds: 14400
+    inputs:
+      parameters:
+        - name: group
+        - name: chunk_indices
+        - name: output_path
+        - name: settings_name
+        - name: nworkers
+        - name: s3_endpoint
+        - name: healpix_image
+      artifacts:
+        - name: cache
+          path: /tmp/in/cache.json
+    volumes:
+      - name: s3-creds
+        secret:
+          secretName: argo-s3-credentials
+    script:
+      image: "{{inputs.parameters.healpix_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        requests:
+          cpu: "4"
+          memory: 16Gi
+        limits:
+          cpu: "4"
+          memory: 16Gi
+      volumeMounts:
+        - name: s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+      source: |
+        # Argo parameters (substituted by Argo before the script runs)
+        group = "{{inputs.parameters.group}}"
+        chunk_indices = r'''{{inputs.parameters.chunk_indices}}'''
+        output_path = "{{inputs.parameters.output_path}}"
+        settings_name = r'''{{inputs.parameters.settings_name}}'''
+        nworkers = "{{inputs.parameters.nworkers}}"
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        import importlib
+        import json
+        import os
+        import sys
+        import time
+        import types
+
+        S3_CREDS_DIR = "/etc/s3"
+        CACHE_FILE = "/tmp/in/cache.json"
+        PUBLIC_READ_PREFIXES = ("s3://grid4earth/public/",)
+        EXIT_INVALID = 2  # not retried by the retryStrategy
+
+
+        def fail(message, code=EXIT_INVALID):
+            print(f"ERROR: {message}", flush=True)
+            sys.exit(code)
+
+
+        def read_s3_credentials():
+            """(key, secret) from the mounted secret, or None when it is not mounted."""
+            key_file = os.path.join(S3_CREDS_DIR, "accessKey")
+            secret_file = os.path.join(S3_CREDS_DIR, "secretKey")
+            if not (os.path.isfile(key_file) and os.path.isfile(secret_file)):
+                return None
+            with open(key_file) as f:
+                key = f.read().strip()
+            with open(secret_file) as f:
+                secret = f.read().strip()
+            return key, secret
+
+
+        def configure_s3(endpoint):
+            """Let s3:// paths opened without storage options use the cluster credentials.
+
+            Must run before the dask cluster starts: the worker processes inherit the
+            AWS_* variables. Returns the storage options for explicit S3 access, or None
+            without credentials.
+            """
+            creds = read_s3_credentials()
+            if creds is None:
+                print(f"no S3 credentials in {S3_CREDS_DIR}: s3:// paths are not accessible")
+                return None
+            key, secret = creds
+            os.environ["AWS_ACCESS_KEY_ID"] = key
+            os.environ["AWS_SECRET_ACCESS_KEY"] = secret
+            if endpoint:
+                os.environ["AWS_ENDPOINT_URL"] = endpoint
+            import fsspec.config
+
+            options = {"key": key, "secret": secret}
+            if endpoint:
+                options["client_kwargs"] = {"endpoint_url": endpoint}
+            fsspec.config.conf["s3"] = json.loads(json.dumps(options))
+            return options
+
+
+        def storage_options_for(url, s3_options):
+            if not url.startswith("s3://"):
+                return None
+            if s3_options is None:
+                fail(f"{url} needs S3 credentials in {S3_CREDS_DIR}", 1)
+            options = json.loads(json.dumps(s3_options))
+            if url.startswith(PUBLIC_READ_PREFIXES):
+                options["s3_additional_kwargs"] = {"ACL": "public-read"}
+            return options
+
+
+        def import_api():
+            try:
+                from healpix_convert import ConvertSettings, ConvertStagingCache, convert_group_to_healpix
+                from legacy_converters import get_settings
+                import healpix_convert as package
+                converters = "healpix_convert.healpix_converters"
+            except ImportError:
+                from legacy_converters import (
+                    ConvertSettings,
+                    ConvertStagingCache,
+                    convert_group_to_healpix,
+                    get_settings,
+                )
+                import legacy_converters as package
+                converters = "legacy_converters.healpix_converters"
+            print(f"converter: {package.__name__} {getattr(package, '__version__', '?')}")
+            return types.SimpleNamespace(
+                ConvertSettings=ConvertSettings,
+                ConvertStagingCache=ConvertStagingCache,
+                convert_group_to_healpix=convert_group_to_healpix,
+                get_settings=get_settings,
+                converters=converters,
+            )
+
+
+        def resolve_settings(api, name):
+            text = name.strip()
+            if text.startswith("{"):
+                settings = api.ConvertSettings.model_validate_json(text)
+            else:
+                settings = api.get_settings(text)
+            if not isinstance(settings, api.ConvertSettings):
+                settings = api.ConvertSettings.model_validate(settings.model_dump())
+            return settings
+
+
+        def skip_empty_chunks(module_name):
+            """A buffered chunk polygon that only grazes an input tile can select 0
+            input points; the dense converter then fails in the resampler ("No HEALPix
+            cell passed the threshold") instead of leaving the chunk empty. Treat 0
+            points like no input: the chunk keeps its cell ids and fill values."""
+            module = importlib.import_module(module_name)
+            cls = getattr(module, "UniformChunkConverter", None) or getattr(module, "DenseChunkConverter", None)
+            if cls is None or getattr(cls.query_input_points, "g4e_patched", False):
+                return
+            original = cls.query_input_points
+
+            def query_input_points(self, chunk_cell_id):
+                points = original(self, chunk_cell_id)
+                if points is not None and points.sizes.get("points", 1) == 0:
+                    print(f"chunk cell {chunk_cell_id}: no input point, left empty", flush=True)
+                    return None
+                return points
+
+            query_input_points.g4e_patched = True
+            cls.query_input_points = query_input_points
+
+
+        def float64_resampler_coordinates(module_name):
+            """The resamplers fail ("Index put requires the source and destination dtypes
+            match") when given float32 longitudes / latitudes, which the no_chunk groups
+            pass as stored (e.g. Sentinel-2 conditions/meteorology). Cast them to float64."""
+            import numpy as np
+
+            module = importlib.import_module(module_name)
+            classes = getattr(module, "_RESAMPLER_NAME_CLS", None)
+            if not isinstance(classes, dict):
+                return
+            for name, cls in list(classes.items()):
+                if getattr(cls, "g4e_patched", False):
+                    continue
+
+                def make(*args, _cls=cls, **kwargs):
+                    for key in ("lon_deg", "lat_deg"):
+                        if kwargs.get(key) is not None:
+                            kwargs[key] = np.asarray(kwargs[key], dtype="float64")
+                    return _cls(*args, **kwargs)
+
+                make.g4e_patched = True
+                classes[name] = make
+
+
+        def patch_converter(module_name):
+            skip_empty_chunks(module_name)
+            float64_resampler_coordinates(module_name)
+
+
+        def patch_converter_on_workers(client, module_name):
+            """Apply patch_converter in every dask worker process (also restarted ones)."""
+            from distributed.diagnostics.plugin import WorkerPlugin
+
+            class PatchConverter(WorkerPlugin):
+                name = "g4e-patch-converter"
+
+                def setup(self, worker):
+                    patch_converter(module_name)
+
+            register = getattr(client, "register_plugin", None) or client.register_worker_plugin
+            register(PatchConverter())
+
+
+        def parse_chunk_indices(text):
+            """JSON list of chunk indices and/or [start, stop) ranges -> list of ints."""
+            try:
+                items = json.loads(text)
+            except ValueError:
+                items = None
+            if not isinstance(items, list):
+                fail(f"chunk_indices must be a JSON list, got {text!r}")
+            indices = []
+            for item in items:
+                if isinstance(item, int):
+                    indices.append(item)
+                elif isinstance(item, list) and len(item) == 2 and all(isinstance(i, int) for i in item):
+                    indices.extend(range(item[0], item[1]))
+                else:
+                    fail(f"invalid chunk_indices item {item!r} in {text}")
+            if not indices:
+                fail(f"no chunk index in {text}")
+            return indices
+
+
+        def parse_positive_int(name, text):
+            try:
+                value = int(text)
+            except ValueError:
+                value = 0
+            if value < 1:
+                fail(f"{name} must be a positive integer, got {text!r}")
+            return value
+
+
+        def main():
+            indices = parse_chunk_indices(chunk_indices)
+            n_workers = parse_positive_int("nworkers", nworkers)
+            s3_options = configure_s3(s3_endpoint)
+            output_options = storage_options_for(output_path, s3_options)
+
+            api = import_api()
+            patch_converter(api.converters)
+            settings = resolve_settings(api, settings_name)
+            with open(CACHE_FILE) as f:
+                cache = api.ConvertStagingCache.from_json(f.read())
+
+            cluster = client = None
+            if n_workers > 1:
+                from dask.distributed import LocalCluster
+
+                cluster = LocalCluster(n_workers=n_workers, threads_per_worker=1, dashboard_address=None)
+                client = cluster.get_client()
+                patch_converter_on_workers(client, api.converters)
+
+            print(f"group {group}: {len(indices)} chunk(s), {indices[0]}..{indices[-1]}, "
+                  f"{n_workers} worker(s)")
+            start = time.monotonic()
+            try:
+                # writes whole output chunks only, so re-running a task (retry) is harmless
+                api.convert_group_to_healpix(
+                    group,
+                    cache=cache,
+                    settings=settings,
+                    output_path=output_path,
+                    chunk_indices=indices,
+                    output_storage_options=output_options,
+                )
+            finally:
+                if client is not None:
+                    client.close()
+                    cluster.close()
+            print(f"done in {time.monotonic() - start:.0f} s")
+
+
+        if __name__ == "__main__":
+            main()
+
+  - name: finalize
+    retryStrategy:
+      limit: "2"
+      retryPolicy: Always
+      # exit code 2 = incomplete output: retrying cannot help (use `argo retry`)
+      expression: 'lastRetry.exitCode != "2"'
+      backoff:
+        duration: "30s"
+        factor: "2"
+    activeDeadlineSeconds: 3600
+    inputs:
+      parameters:
+        - name: output_path
+        - name: settings_name
+        - name: s3_endpoint
+        - name: healpix_image
+      artifacts:
+        - name: cache
+          path: /tmp/in/cache.json
+    outputs:
+      parameters:
+        - name: output_path
+          valueFrom:
+            path: /tmp/out/output_path
+        - name: stac_item_id
+          valueFrom:
+            path: /tmp/out/stac_item_id
+    volumes:
+      - name: s3-creds
+        secret:
+          secretName: argo-s3-credentials
+    script:
+      image: "{{inputs.parameters.healpix_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+        limits:
+          cpu: "2"
+          memory: 8Gi
+      volumeMounts:
+        - name: s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+      source: |
+        # Argo parameters (substituted by Argo before the script runs)
+        output_path = "{{inputs.parameters.output_path}}"
+        settings_name = r'''{{inputs.parameters.settings_name}}'''
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        import json
+        import os
+        import sys
+        import types
+        from pathlib import PurePath
+
+        S3_CREDS_DIR = "/etc/s3"
+        CACHE_FILE = "/tmp/in/cache.json"
+        OUT_DIR = "/tmp/out"
+        PUBLIC_READ_PREFIXES = ("s3://grid4earth/public/",)
+        PENDING_STAC_KEY = "stac_discovery_pending"  # written by prepare
+        EXIT_INCOMPLETE = 2  # not retried by the retryStrategy
+
+
+        def fail(message, code=1):
+            print(f"ERROR: {message}", flush=True)
+            sys.exit(code)
+
+
+        def read_s3_credentials():
+            """(key, secret) from the mounted secret, or None when it is not mounted."""
+            key_file = os.path.join(S3_CREDS_DIR, "accessKey")
+            secret_file = os.path.join(S3_CREDS_DIR, "secretKey")
+            if not (os.path.isfile(key_file) and os.path.isfile(secret_file)):
+                return None
+            with open(key_file) as f:
+                key = f.read().strip()
+            with open(secret_file) as f:
+                secret = f.read().strip()
+            return key, secret
+
+
+        def configure_s3(endpoint):
+            """Let s3:// paths opened without storage options use the cluster credentials.
+
+            Returns the storage options for explicit S3 access, or None without credentials.
+            """
+            creds = read_s3_credentials()
+            if creds is None:
+                print(f"no S3 credentials in {S3_CREDS_DIR}: s3:// paths are not accessible")
+                return None
+            key, secret = creds
+            os.environ["AWS_ACCESS_KEY_ID"] = key
+            os.environ["AWS_SECRET_ACCESS_KEY"] = secret
+            if endpoint:
+                os.environ["AWS_ENDPOINT_URL"] = endpoint
+            import fsspec.config
+
+            options = {"key": key, "secret": secret}
+            if endpoint:
+                options["client_kwargs"] = {"endpoint_url": endpoint}
+            fsspec.config.conf["s3"] = json.loads(json.dumps(options))
+            return options
+
+
+        def storage_options_for(url, s3_options):
+            if not url.startswith("s3://"):
+                return None
+            if s3_options is None:
+                fail(f"{url} needs S3 credentials in {S3_CREDS_DIR}")
+            options = json.loads(json.dumps(s3_options))
+            if url.startswith(PUBLIC_READ_PREFIXES):
+                options["s3_additional_kwargs"] = {"ACL": "public-read"}
+            return options
+
+
+        def import_api():
+            try:
+                from healpix_convert import ConvertSettings
+                from legacy_converters import get_settings
+            except ImportError:
+                from legacy_converters import ConvertSettings, get_settings
+            return types.SimpleNamespace(ConvertSettings=ConvertSettings, get_settings=get_settings)
+
+
+        def resolve_settings(api, name):
+            text = name.strip()
+            if text.startswith("{"):
+                settings = api.ConvertSettings.model_validate_json(text)
+            else:
+                settings = api.get_settings(text)
+            if not isinstance(settings, api.ConvertSettings):
+                settings = api.ConvertSettings.model_validate(settings.model_dump())
+            return settings
+
+
+        def put_attrs(group, attrs):
+            if hasattr(group.attrs, "put"):
+                group.attrs.put(attrs)
+            else:
+                for key in [k for k in group.attrs if k not in attrs]:
+                    del group.attrs[key]
+                group.attrs.update(attrs)
+
+
+        def main():
+            s3_options = configure_s3(s3_endpoint)
+            output_options = storage_options_for(output_path, s3_options)
+
+            import xarray as xr
+            import zarr
+
+            settings = resolve_settings(import_api(), settings_name)
+            # plain JSON: the group layout is all that is needed here, re-opening the
+            # inputs with ConvertStagingCache.from_json would only cost time
+            with open(CACHE_FILE) as f:
+                cache = json.load(f)
+            spatial_groups = set(cache["input_spatial_groups"])
+            io_path_map = cache["output_groups"]["io_path_map"]
+
+            root = zarr.open_group(output_path, mode="r+", storage_options=output_options)
+
+            # every chunk task of a dense group writes the cell ids of its chunks, so a
+            # missing cell id chunk means a chunk that was never converted. (A task that
+            # failed after writing the cell ids of a chunk is not detected here, but a
+            # failed task fails the run before finalize.)
+            problems = []
+            for input_group in sorted(spatial_groups):
+                output_group = io_path_map[input_group]
+                group_settings = settings.group_settings[PurePath(input_group)]
+                coordinate = getattr(group_settings.healpix, "coordinate", "cell_ids")
+                method = group_settings.chunk.method
+                if not isinstance(coordinate, str) or f"{output_group}/{coordinate}" not in root:
+                    problems.append(f"{output_group}: no {coordinate} array")
+                    continue
+                cell_ids = root[f"{output_group}/{coordinate}"]
+                written, expected = cell_ids.nchunks_initialized, cell_ids.nchunks
+                print(f"  - {output_group} ({method}): {written}/{expected} cell id chunk(s) written")
+                if method == "healpix_cell_dense" and written != expected:
+                    problems.append(f"{output_group}: {expected - written} chunk(s) missing")
+                elif written == 0:
+                    # e.g. no_chunk groups with legacy_converters de458eb, which skips them
+                    print(f"WARNING: {output_group} has no data (not converted by this converter version?)")
+            if problems:
+                fail("incomplete output (re-run the failed tasks with `argo retry`):\n  "
+                     + "\n  ".join(problems), EXIT_INCOMPLETE)
+
+            # publish the STAC item held back by prepare: stac-scraper indexes the
+            # dataset from now on
+            attrs = dict(root.attrs)
+            if PENDING_STAC_KEY in attrs:
+                attrs["stac_discovery"] = attrs.pop(PENDING_STAC_KEY)
+                put_attrs(root, attrs)
+                print("published the root stac_discovery")
+            elif "stac_discovery" not in attrs:
+                fail("the root group has neither stac_discovery nor " + PENDING_STAC_KEY, EXIT_INCOMPLETE)
+            zarr.consolidate_metadata(root.store)
+            print(f"consolidated metadata of {output_path}")
+
+            tree = xr.open_datatree(
+                output_path,
+                engine="zarr",
+                storage_options=output_options,
+                chunks={},
+                create_default_indexes=False,
+            )
+            print("output groups:")
+            for path in tree.groups:
+                node = tree[path]
+                if node.data_vars:
+                    size = sum(v.nbytes for v in node.data_vars.values()) / 1e9
+                    print(f"  - {path}: {dict(node.sizes)} {sorted(node.data_vars)} ({size:.2f} GB)")
+            stac = tree.attrs.get("stac_discovery")
+            if not isinstance(stac, dict) or not stac.get("id"):
+                fail("the root group has no stac_discovery item (with an id)", EXIT_INCOMPLETE)
+            props = stac.get("properties", {})
+            print(f"stac_discovery id: {stac['id']}")
+            print(f"bbox: {stac.get('bbox')}, datetime: {props.get('datetime')} "
+                  f"({props.get('start_datetime')} / {props.get('end_datetime')})")
+
+            os.makedirs(OUT_DIR, exist_ok=True)
+            with open(os.path.join(OUT_DIR, "output_path"), "w") as f:
+                f.write(output_path)
+            with open(os.path.join(OUT_DIR, "stac_item_id"), "w") as f:
+                f.write(stac["id"])
+
+
+        if __name__ == "__main__":
+            main()

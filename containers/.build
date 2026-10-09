@@ -6,6 +6,8 @@ docker build --progress=plain --secret id=gitlab_token,src=/home/ubuntu/.gitlab_
 docker build --progress=plain --secret id=gitlab_token,src=/tmp/tik_token -t g4e-s3syn:latest -f Dockerfile_s3syn_minimal .       # Using Tik's token
 docker pull y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:latest
 docker build --progress=plain --secret id=github_token,env=GITHUB_TOKEN -t g4e-jupyterhub-private:2026-10-01 -f Dockerfile_private_update .
+docker pull y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-01
+docker build --progress=plain --secret id=github_token,env=GITHUB_TOKEN -t g4e-jupyterhub-private:2026-10-10-orbit -f Dockerfile_private_orbit .
 docker pull y74y55mn.gra7.container-registry.ovh.net/healpix-private/s3syn:latest
 docker build --progress=plain -t g4e-s3syn:2026-10-01 -f Dockerfile_s3syn_update .
 docker build --progress=plain --secret id=gitlab_token,src=/home/ubuntu/.gitlab_token -t g4e-s2msi:fefecebf -f Dockerfile_s2msi_fefecebf .
@@ -17,6 +19,8 @@ docker tag g4e-s3syn:latest y74y55mn.gra7.container-registry.ovh.net/healpix-pri
 docker push y74y55mn.gra7.container-registry.ovh.net/healpix-private/s3syn:latest
 docker tag g4e-jupyterhub-private:2026-10-01 y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-01
 docker push y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-01
+docker tag g4e-jupyterhub-private:2026-10-10-orbit y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-10-orbit
+docker push y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-10-orbit
 docker tag g4e-s3syn:2026-10-01 y74y55mn.gra7.container-registry.ovh.net/healpix-private/s3syn:2026-10-01
 docker push y74y55mn.gra7.container-registry.ovh.net/healpix-private/s3syn:2026-10-01
 docker tag g4e-s2msi:fefecebf y74y55mn.gra7.container-registry.ovh.net/healpix-private/s2msi:fefecebf
