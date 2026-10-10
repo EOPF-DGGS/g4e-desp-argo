@@ -40,17 +40,19 @@ artifactRepositoryRef:
   artifact-repositories:
     annotations:
       workflows.argoproj.io/default-artifact-repository: default-v1-s3
-    data:
-      default-v1-s3: |
-        archiveLogs: true
-        s3:
-          bucket: g4e-desp-argo-artifacts
-          endpoint: s3.gra.io.cloud.ovh.net
-          insecure: false
-          region: gra
-          accessKeySecret:
-            name: argo-s3-credentials
-            key: accessKey
-          secretKeySecret:
-            name: argo-s3-credentials
-            key: secretKey
+    # Every key other than "annotations" becomes a ConfigMap data key (chart
+    # template artifact-repository-ref-cm.yaml), so the repository is given as
+    # a map directly under the ConfigMap name, not under "data:".
+    default-v1-s3:
+      archiveLogs: true
+      s3:
+        bucket: g4e-desp-argo-artifacts
+        endpoint: s3.gra.io.cloud.ovh.net
+        insecure: false
+        region: gra
+        accessKeySecret:
+          name: argo-s3-credentials
+          key: accessKey
+        secretKeySecret:
+          name: argo-s3-credentials
+          key: secretKey
