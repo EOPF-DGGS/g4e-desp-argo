@@ -1,0 +1,1706 @@
+# Mirror every Sentinel product of ONE satellite orbit (same sat:absolute_orbit)
+# over a region into s3://grid4earth/public/eopf-mirror/<collection>/ as EOPF Zarr.
+#
+#   query        CDSE STAC search (+ optional EOPF Sample Service lookup); outputs
+#                the item list and the names and extent used by the HEALPix step.
+#   mirror-item  one pod per product: copy the Sample Service Zarr if there is one,
+#                else download the SAFE zip from CDSE and convert it with eopf.
+#                Complete stores (root zarr.json with stac_discovery) are skipped.
+#                The STAC id (stac_discovery.id) of a new store is its product
+#                name (see "Item ids" below).
+#
+# Region (lat_range, default "45.0,49.0" = 45..49 N, Massif Central to Paris; the
+# preset "france" = 41.3..51.2 stays available): the orbit is cut as a LATITUDE
+# BAND over the full swath width, snapped to HEALPix parent cells (align_level,
+# nested, WGS84) so that later regional products line up:
+#   1. search the orbit in the band widened by 2 align_level cells and group the
+#      footprints into passes: connected parts, joined when their sensing times
+#      are within 5 min and their longitudes overlap (a gap along the track, e.g.
+#      a missing row of tiles, does not split a pass). The orbit may cross the
+#      band twice (day / night halves, SLSTR): keep the pass of the reference
+#      item (manual mode: the pass that intersects bbox; bbox is required when
+#      there are several);
+#   2. S = union of the footprints of that pass, cut to the band;
+#   3. align_level cells over S.bounds, kept when the cell intersects S
+#      (align_rule=intersects) or, with align_rule=within, when it also lies
+#      entirely inside the band; partial cells at the swath edges are kept;
+#   4. region = union of the kept cells: ONE polygon (healpix-convert refuses a
+#      MultiPolygon; holes, i.e. gaps in the swath, are filled and their cells
+#      counted as kept);
+#   5. products = the products of the pass whose footprint intersects the region.
+# Outputs: output_extent = the region as a compact GeoJSON Polygon drawn through
+# the cell corners and moved 1e-5 deg inwards, so that healpix-convert (healpix_geo
+# polygon_coverage, which joins the vertices with great-circle arcs and also
+# returns the cells that only touch the polygon) converts the chunks inside the
+# kept cells. This is checked at level 11 (the Sentinel-2 chunk level; coarser
+# levels follow) when that is at most 4**11 cells, and stage-cache compares the
+# chunk count of every group with n_cells; both print a WARNING on a mismatch.
+# Exact in every case tried with align_level 6 or 7; with align_level <= 5 near the
+# poles chunks along the edges of the kept cells can be lost (warned).
+# extent_info = JSON {mode: band, lat_range, align_level, align_rule, ellipsoid,
+# indexing_scheme, n_cells, lat/lon_min/max_actual}.
+# With lat_range "" (or "none") the region is bbox (minx,miny,maxx,maxy or
+# "france"; empty = whole orbit), output_extent is "" and extent_info {mode: bbox
+# or orbit, bbox}.
+# In band mode bbox only picks the pass.
+#
+# Region tag (last part of healpix_name, {platform}_{type}_{first sensing start}_
+# R{relative orbit}_O{absolute orbit}_{region}): an explicit region_name always
+# wins (upper-cased, except the "p" of a name shaped like a band tag, so that
+# region_name=n41p3-n51p2 gives N41p3-N51p2 as the band itself would); else the
+# lat_range preset name (france -> FRANCE); else, for
+# a numeric band, the band itself: hemisphere letter N / S and absolute degrees per
+# bound, integers without decimals and the decimal point of the others written
+# "p" (45.0,49.0 -> N45-N49; 41.3,51.2 -> N41p3-N51p2; -12.5,-3 -> S12p5-S3);
+# without lat_range the bbox preset (FRANCE) or REGION. The tag may only hold
+# letters, digits and "-" (the name is split on "_").
+#
+# Sample Service: its stores and the eopf conversions of the CDSE SAFE carry
+# different STAC metadata (stac_extensions versions), which healpix-convert cannot
+# merge into one HEALPix dataset. The Sample Service is therefore used only when it
+# has EVERY product of the orbit; otherwise everything comes from CDSE.
+#
+# Item ids: eopf (3.0 / rc4) gives every tile of one Sentinel-2 datatake the same
+# id except for a 3-hex-digit CRC (4096 values), e.g. S02MSIL2A_20250613T104641_0000_C051_T266:
+# among the 71 products of the France run (lat_range=france) of orbit 4025 the
+# chance of a duplicate is about 46 % (31 products of the default band 45..49 N:
+# about 11 %), and the STAC API answers 404 for every item of a duplicated id
+# (stac-scraper-update then stops). mirror-item therefore sets the
+# stac_discovery.id of the store it uploads to the product name: the store name
+# without .zarr and without a .SEN3 / .SAFE suffix, e.g.
+# S2C_MSIL2A_20250613T104641_N0511_R051_T31UDQ_20250613T134507, the id that
+# stac-scraper --id-from-store-name (stac-scraper PR #24) gives. The eopf id is
+# kept in the root attribute g4e_mirror.eopf_stac_id. Stores mirrored before
+# keep their eopf id (complete stores are skipped).
+#
+# CDSE allows 4 concurrent connections per account: the DAG runs at most 4
+# mirror pods (do not run legacy-datasets download_orbit.py with the same account
+# at the same time), and HTTP 429/503 answers wait for Retry-After.
+#
+# The DAG template 'main' takes every argument as an input parameter and exposes
+# mirror_paths / orbit / healpix_output_path / healpix_name / output_extent /
+# extent_info as outputs, so another WorkflowTemplate can call it with
+# templateRef {name: cdse-orbit-to-eopf-mirror, template: main}.
+#
+# Secrets: argo-s3-credentials (accessKey, secretKey) and argo-cdse-credentials
+# (username, password: a Copernicus Data Space Ecosystem account). The CDSE secret
+# is mounted as optional: without it a product that needs a CDSE download fails at
+# once (exit 2, not retried) instead of leaving the pod in ContainerCreating.
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cdse-orbit-to-eopf-mirror
+  namespace: argo
+spec:
+  entrypoint: main
+  serviceAccountName: argo-workflow
+  imagePullSecrets:
+    - name: harbor-pull-secret
+  arguments:
+    parameters:
+      - name: collection
+        value: sentinel-2-l2a
+        description: CDSE STAC collection id (e.g. sentinel-2-l2a, sentinel-3-olci-1-efr-ntc)
+      - name: reference_item
+        value: ""
+        description: CDSE item id; platform, absolute/relative orbit and time window are taken from it (leave platform, relative_orbit, absolute_orbit and datetime empty)
+      - name: platform
+        value: ""
+        description: manual mode (no reference_item), e.g. sentinel-2c
+      - name: relative_orbit
+        value: ""
+        description: manual mode, sat:relative_orbit
+      - name: absolute_orbit
+        value: ""
+        description: manual mode, client-side filter on sat:absolute_orbit
+      - name: datetime
+        value: ""
+        description: manual mode, STAC datetime range start/end
+      - name: lat_range
+        value: "45.0,49.0"
+        description: latitude band min,max (deg, default 45..49 N) or the preset "france" (41.3,51.2), cut over the full swath width and snapped to align_level cells; empty (or "none") = use bbox
+      - name: align_level
+        value: "7"
+        description: HEALPix level (nested, WGS84) of the parent cells the band is snapped to, 0..11 (not above the chunk level of the conversion settings)
+      - name: align_rule
+        value: intersects
+        enum: ["intersects", "within"]
+        description: keep a cell that intersects swath and band (intersects) or only cells entirely inside the band (within)
+      - name: bbox
+        value: ""
+        description: minx,miny,maxx,maxy or the preset "france"; with lat_range it only picks the pass when the orbit crosses the band twice; without lat_range it is the region (empty = whole orbit)
+      - name: region_name
+        value: ""
+        description: last part of the HEALPix output name (letters, digits and '-', upper-cased; the 'p' of a band-shaped name stays lower case); empty = the band tag (lat_range 45.0,49.0 -> N45-N49, 41.3,... -> N41p3-...), FRANCE for lat_range "france" (or, without lat_range, the France bbox), else REGION
+      - name: mirror_prefix
+        value: s3://grid4earth/public/eopf-mirror
+      - name: converted_prefix
+        value: s3://grid4earth/public/converted
+      - name: check_sample_service
+        value: "true"
+        enum: ["true", "false"]
+        description: copy the products from the EOPF Sample Service when it has all of them
+      - name: max_items
+        value: "1000"
+      - name: parallelism
+        value: "4"
+        description: informational only, the DAG runs at most 4 mirror pods at a time (CDSE limit; Argo cannot template parallelism)
+      - name: s3_endpoint
+        value: https://s3.gra.io.cloud.ovh.net
+      - name: eopf_image
+        value: y74y55mn.gra7.container-registry.ovh.net/healpix-private/s2msi:fefecebf
+      - name: healpix_image
+        value: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-01
+  templates:
+  - name: main
+    inputs:
+      parameters:
+        - name: collection
+        - name: reference_item
+        - name: platform
+        - name: relative_orbit
+        - name: absolute_orbit
+        - name: datetime
+        - name: lat_range
+        - name: align_level
+        - name: align_rule
+        - name: bbox
+        - name: region_name
+        - name: mirror_prefix
+        - name: converted_prefix
+        - name: check_sample_service
+        - name: max_items
+        - name: parallelism
+        - name: s3_endpoint
+        - name: eopf_image
+        - name: healpix_image
+    # Template.parallelism is an int64 in Argo, so "{{inputs.parameters.parallelism}}"
+    # is rejected. 4 = the CDSE limit of concurrent connections per account: every
+    # pod may download from CDSE with the same account.
+    parallelism: 4
+    dag:
+      # keep mirroring the other products when one fails; the run still ends Failed
+      # and a resubmit skips the products that were completed.
+      failFast: false
+      tasks:
+        - name: query
+          template: query
+          arguments:
+            parameters:
+              - name: collection
+                value: "{{inputs.parameters.collection}}"
+              - name: reference_item
+                value: "{{inputs.parameters.reference_item}}"
+              - name: platform
+                value: "{{inputs.parameters.platform}}"
+              - name: relative_orbit
+                value: "{{inputs.parameters.relative_orbit}}"
+              - name: absolute_orbit
+                value: "{{inputs.parameters.absolute_orbit}}"
+              - name: datetime
+                value: "{{inputs.parameters.datetime}}"
+              - name: lat_range
+                value: "{{inputs.parameters.lat_range}}"
+              - name: align_level
+                value: "{{inputs.parameters.align_level}}"
+              - name: align_rule
+                value: "{{inputs.parameters.align_rule}}"
+              - name: bbox
+                value: "{{inputs.parameters.bbox}}"
+              - name: region_name
+                value: "{{inputs.parameters.region_name}}"
+              - name: mirror_prefix
+                value: "{{inputs.parameters.mirror_prefix}}"
+              - name: converted_prefix
+                value: "{{inputs.parameters.converted_prefix}}"
+              - name: check_sample_service
+                value: "{{inputs.parameters.check_sample_service}}"
+              - name: max_items
+                value: "{{inputs.parameters.max_items}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+        - name: mirror
+          template: mirror-item
+          dependencies: [query]
+          withParam: "{{tasks.query.outputs.parameters.items}}"
+          arguments:
+            parameters:
+              - name: item
+                value: "{{item}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: eopf_image
+                value: "{{inputs.parameters.eopf_image}}"
+    outputs:
+      parameters:
+        - name: mirror_paths
+          valueFrom:
+            parameter: "{{tasks.query.outputs.parameters.mirror_paths}}"
+        - name: orbit
+          valueFrom:
+            parameter: "{{tasks.query.outputs.parameters.orbit}}"
+        - name: healpix_output_path
+          valueFrom:
+            parameter: "{{tasks.query.outputs.parameters.healpix_output_path}}"
+        - name: healpix_name
+          valueFrom:
+            parameter: "{{tasks.query.outputs.parameters.healpix_name}}"
+        # GeoJSON Polygon of the region in band mode, "" otherwise
+        - name: output_extent
+          valueFrom:
+            parameter: "{{tasks.query.outputs.parameters.output_extent}}"
+        # JSON: how the region was built (mode band / bbox / orbit)
+        - name: extent_info
+          valueFrom:
+            parameter: "{{tasks.query.outputs.parameters.extent_info}}"
+
+  - name: query
+    inputs:
+      parameters:
+        - name: collection
+        - name: reference_item
+        - name: platform
+        - name: relative_orbit
+        - name: absolute_orbit
+        - name: datetime
+        - name: lat_range
+        - name: align_level
+        - name: align_rule
+        - name: bbox
+        - name: region_name
+        - name: mirror_prefix
+        - name: converted_prefix
+        - name: check_sample_service
+        - name: max_items
+        - name: healpix_image
+    outputs:
+      parameters:
+        - name: items
+          valueFrom:
+            path: /tmp/out/items.json
+        - name: mirror_paths
+          valueFrom:
+            path: /tmp/out/mirror_paths.json
+        - name: orbit
+          valueFrom:
+            path: /tmp/out/orbit.json
+        - name: healpix_name
+          valueFrom:
+            path: /tmp/out/healpix_name.txt
+        - name: healpix_output_path
+          valueFrom:
+            path: /tmp/out/healpix_output_path.txt
+        - name: output_extent
+          valueFrom:
+            path: /tmp/out/output_extent.json
+        - name: extent_info
+          valueFrom:
+            path: /tmp/out/extent_info.json
+    retryStrategy:
+      limit: "2"
+      retryPolicy: Always
+      # exit code 2 = invalid arguments or not exactly one orbit: retrying cannot help
+      expression: 'lastRetry.exitCode != "2"'
+      backoff:
+        duration: "30s"
+        factor: "2"
+    # per attempt; also bounds a pod stuck in Pending (ImagePullBackOff)
+    activeDeadlineSeconds: 1800
+    script:
+      image: "{{inputs.parameters.healpix_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        limits:
+          cpu: "1"
+          memory: 2Gi
+        requests:
+          cpu: 500m
+          memory: 1Gi
+      source: |
+        """Select the CDSE items of ONE absolute orbit and write the pipeline parameters.
+
+        Same selection as legacy-datasets safe-to-zarr/download_orbit.py and
+        download_orbit_after_checking_sample_service.py:
+          * sat:absolute_orbit is not a CDSE queryable, so search a datetime window
+            (reference item +- one orbit period, or the given range) with platform /
+            sat:relative_orbit where the collection allows them, then filter
+            sat:absolute_orbit (and platform / relative orbit) client-side;
+          * fail unless exactly one absolute orbit remains;
+          * band mode (lat_range set): cut the orbit as a latitude band over the full
+            swath width, snapped to HEALPix cells of align_level (select_band);
+          * optionally find each product on the EOPF Sample Service (one search over
+            the whole orbit): same id first, else same sensing (S2: id without the
+            processing time; S3: sensing start/stop, timeliness and baseline) within
+            +-5 min, latest processing first. The Sample Service is used only when it
+            has every product of the orbit.
+        """
+        import json
+        import math
+        import os
+        import posixpath
+        import re
+        import sys
+        import urllib.request
+        from collections import Counter
+        from datetime import datetime, timedelta
+
+        import pystac_client
+
+        collection = "{{inputs.parameters.collection}}"
+        reference_item = "{{inputs.parameters.reference_item}}"
+        platform = "{{inputs.parameters.platform}}"
+        relative_orbit = "{{inputs.parameters.relative_orbit}}"
+        absolute_orbit = "{{inputs.parameters.absolute_orbit}}"
+        datetime_range = "{{inputs.parameters.datetime}}"
+        lat_range = "{{inputs.parameters.lat_range}}"
+        align_level = "{{inputs.parameters.align_level}}"
+        align_rule = "{{inputs.parameters.align_rule}}"
+        bbox = "{{inputs.parameters.bbox}}"
+        region_name = "{{inputs.parameters.region_name}}"
+        mirror_prefix = "{{inputs.parameters.mirror_prefix}}"
+        converted_prefix = "{{inputs.parameters.converted_prefix}}"
+        check_sample_service = "{{inputs.parameters.check_sample_service}}"
+        max_items = "{{inputs.parameters.max_items}}"
+
+        OUT_DIR = "/tmp/out"
+        CDSE_STAC_URL = "https://stac.dataspace.copernicus.eu/v1/"
+        EOPF_STAC_URL = "https://stac.core.eopf.eodc.eu"
+        ORBIT_PERIOD = timedelta(minutes=101)  # S2 ~100.6 min, S3 ~101 min
+        SAMPLE_SERVICE_WINDOW = timedelta(minutes=5)
+        EXIT_INVALID = 2  # deterministic error, not retried by the retryStrategy
+        # named regions accepted by bbox; a bbox equal to a preset names the output
+        # after it (as legacy-datasets download_orbit.py --bbox france)
+        BBOX_PRESETS = {"france": (-5.3, 41.3, 9.6, 51.2)}
+        # named latitude bands accepted by lat_range; the preset NAME names the output
+        # (france -> FRANCE), explicit numbers give the band tag (band_tag)
+        LAT_RANGE_PRESETS = {"france": (41.3, 51.2)}
+        DEFAULT_REGION_NAME = "REGION"
+        REGION_TAG = re.compile(r"[A-Za-z0-9-]+")  # the HEALPix name is split on "_"
+        # an explicit region_name of this shape keeps the lower-case "p" of band_tag
+        BAND_TAG = re.compile(r"[NS]\d+(?:P\d+)?-[NS]\d+(?:P\d+)?")
+        LAT_RANGE_OFF = ("", "none")  # lat_range values that select bbox mode
+        # band mode: HEALPix grid of the parent cells (that of the conversion settings)
+        HEALPIX_ELLIPSOID = "WGS84"
+        HEALPIX_INDEXING = "nested"
+        # align_level must not exceed the chunk level of the conversion settings
+        # (S2: 11): healpix-convert clips the output per chunk, not per cell
+        MAX_ALIGN_LEVEL = 11
+        ALIGN_RULES = ("intersects", "within")
+        VERTEX_STEP = 4  # vertices per cell side for the cell tests: cell edges are curves in lon/lat
+        # output_extent is the union of the kept cells drawn through their CORNERS only:
+        # healpix-convert gives its vertices to healpix_geo polygon_coverage, which joins
+        # them with great-circle arcs like its own cell model, and moved EXTENT_INSET deg
+        # inwards, because polygon_coverage also returns the cells that only touch the
+        # polygon. Then the chunks inside the kept cells are converted (the densified
+        # union instead adds a ring of outside chunks). Checked at CHECK_LEVEL, the
+        # finest chunk level of the settings (S2), where a chunk lost or added along a
+        # cell edge shows first, when the kept cells have at most CHECK_MAX_CELLS
+        # children there (else at the finest level below that does).
+        EXTENT_INSET = 1e-5
+        CHECK_LEVEL = MAX_ALIGN_LEVEL
+        CHECK_MAX_CELLS = 4**11
+        # footprints closer than this (deg) belong to the same pass over the band
+        COMPONENT_TOLERANCE = 0.01
+        # parts of the footprints whose sensing times are closer than this and whose
+        # longitudes overlap belong to the same pass: the products of one pass follow each
+        # other (S3: 3-min products; S2: every tile carries its datatake start), while the
+        # two crossings of a latitude band by one orbit (ascending / descending) lie far
+        # apart in longitude (and, below ~65 deg, at least ~15 min apart)
+        PASS_TIME_GAP = timedelta(minutes=5)
+        EXTENT_DECIMALS = 7  # output_extent coordinates (~1 cm)
+        HTTP_TIMEOUT = (60, 600)  # requests (connect, read) timeouts, s: slow links
+        S3_TIMELINESS = re.compile(r"_(NR|NT|ST)_(\d{3})(?:\.SEN3)?$")
+
+        # CDSE collection id -> G4E (and EOPF Sample Service) collection id
+        G4E_COLLECTIONS = {
+            "sentinel-2-l1c": "sentinel-2-l1c",
+            "sentinel-2-l2a": "sentinel-2-l2a",
+            "sentinel-3-olci-1-efr-ntc": "sentinel-3-olci-l1-efr",
+            "sentinel-3-olci-1-err-ntc": "sentinel-3-olci-l1-err",
+            "sentinel-3-olci-2-lfr-ntc": "sentinel-3-olci-l2-lfr",
+            "sentinel-3-olci-2-lrr-ntc": "sentinel-3-olci-l2-lrr",
+            "sentinel-3-sl-1-rbt-ntc": "sentinel-3-slstr-l1-rbt",
+            "sentinel-3-sl-2-frp-ntc": "sentinel-3-slstr-l2-frp",
+            "sentinel-3-sl-2-lst-ntc": "sentinel-3-slstr-l2-lst",
+        }
+
+
+        def fail(message):
+            print(f"ERROR: {message}", file=sys.stderr, flush=True)
+            sys.exit(EXIT_INVALID)
+
+
+        def parse_dt(value):
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+        def parse_int(name, value):
+            value = value.strip()
+            if not value:
+                return None
+            try:
+                return int(value)
+            except ValueError:
+                fail(f"{name} must be an integer, got {value!r}")
+
+
+        def parse_bbox(value):
+            """(bbox, preset name) from "minx,miny,maxx,maxy" or a preset name."""
+            text = value.strip()
+            if not text:
+                return None, None
+            if text.lower() in BBOX_PRESETS:
+                return list(BBOX_PRESETS[text.lower()]), text.lower()
+            try:
+                parts = [float(v) for v in text.split(",")]
+            except ValueError:
+                parts = []
+            if len(parts) != 4:
+                fail(f"bbox must be minx,miny,maxx,maxy or one of {sorted(BBOX_PRESETS)}, got {value!r}")
+            minx, miny, maxx, maxy = parts
+            if not (-180 <= minx < maxx <= 180 and -90 <= miny < maxy <= 90):
+                fail(f"bbox needs -180 <= minx < maxx <= 180 and -90 <= miny < maxy <= 90, got {value!r}")
+            for name, preset in BBOX_PRESETS.items():
+                if all(abs(a - b) < 1e-9 for a, b in zip(parts, preset)):
+                    return parts, name
+            return parts, None
+
+
+        def parse_lat_range(value):
+            """(lat_range, preset name) from "min,max" or a preset name; (None, None) when empty
+            or "none" (bbox mode)."""
+            text = value.strip()
+            if text.lower() in LAT_RANGE_OFF:
+                return None, None
+            if text.lower() in LAT_RANGE_PRESETS:
+                return list(LAT_RANGE_PRESETS[text.lower()]), text.lower()
+            try:
+                parts = [float(v) for v in text.split(",")]
+            except ValueError:
+                parts = []
+            if len(parts) != 2:
+                fail(f"lat_range must be min,max, one of {sorted(LAT_RANGE_PRESETS)} or empty / 'none' "
+                     f"(bbox mode), got {value!r}")
+            if not -90 <= parts[0] < parts[1] <= 90:
+                fail(f"lat_range needs -90 <= min < max <= 90, got {value!r}")
+            return parts, None
+
+
+        def parse_align_level(value):
+            level = parse_int("align_level", value)
+            if level is None or not 0 <= level <= MAX_ALIGN_LEVEL:
+                fail(f"align_level must be an integer in [0, {MAX_ALIGN_LEVEL}], got {value!r}")
+            return level
+
+
+        def parse_align_rule(value):
+            rule = value.strip().lower()
+            if rule not in ALIGN_RULES:
+                fail(f"align_rule must be one of {list(ALIGN_RULES)}, got {value!r}")
+            return rule
+
+
+        def band_tag(lat_min, lat_max):
+            """Region tag of a numeric latitude band: hemisphere letter + absolute degrees
+            per bound, "p" for the decimal point: 45.0,49.0 -> N45-N49, 41.3,51.2 ->
+            N41p3-N51p2, -12.5,-3 -> S12p5-S3 (0 is N)."""
+            from decimal import Decimal
+
+            def bound(value):
+                text = format(Decimal(repr(abs(value))), "f")  # positional, no exponent
+                if "." in text:
+                    text = text.rstrip("0").rstrip(".")
+                return ("S" if value < 0 else "N") + text.replace(".", "p")
+
+            return f"{bound(lat_min)}-{bound(lat_max)}"
+
+
+        def resolve_region_name(value, lat_band, lat_preset, bbox_preset):
+            """Last part of the HEALPix name, see "Region tag" in the template header.
+
+            An explicit region_name wins (upper-cased; a name shaped like a band tag keeps
+            a lower-case "p": n41p3-n51p2 -> N41p3-N51p2, as band_tag writes it); band
+            mode: the lat_range preset (FRANCE), else the band tag (N45-N49, kept as is:
+            "p" stays lower case); bbox mode: the bbox preset (FRANCE), else REGION. Same
+            rule as legacy-datasets download_orbit.resolve_region_name.
+            """
+            name = value.strip()
+            if name:
+                source = "region_name"
+            elif lat_band:
+                name = lat_preset.upper() if lat_preset else band_tag(*lat_band)
+                source = "lat_range"
+            else:
+                name = bbox_preset.upper() if bbox_preset else DEFAULT_REGION_NAME
+                source = "bbox"
+            if not REGION_TAG.fullmatch(name):
+                fail(f"the region tag from {source} may only contain letters, digits and '-', got {name!r}")
+            if source != "region_name":
+                return name
+            name = name.upper()
+            return name.replace("P", "p") if BAND_TAG.fullmatch(name) else name
+
+
+        def write_output(name, text):
+            os.makedirs(OUT_DIR, exist_ok=True)
+            with open(os.path.join(OUT_DIR, name), "w") as f:
+                f.write(text)
+
+
+        def open_client(url):
+            """STAC client that retries 429 / 5xx with backoff (the CDSE WAF rate-limits;
+            pystac-client's default retries neither 429 nor POST /search), with
+            HTTP_TIMEOUT on every request (no timeout by default)."""
+            try:
+                from pystac_client.stac_api_io import StacApiIO
+                from urllib3.util.retry import Retry
+            except ImportError:
+                return pystac_client.Client.open(url)
+            retry = Retry(total=6, backoff_factor=5, status_forcelist=(429, 500, 502, 503, 504),
+                          allowed_methods=None, respect_retry_after_header=True,
+                          raise_on_status=False)
+            for kwargs in (dict(max_retries=retry, timeout=HTTP_TIMEOUT), dict(max_retries=retry)):
+                try:
+                    return pystac_client.Client.open(url, stac_io=StacApiIO(**kwargs))
+                except TypeError:  # older pystac-client: no timeout / max_retries
+                    continue
+            return pystac_client.Client.open(url)
+
+
+        def server_queryables(coll):
+            """Properties the CDSE collection accepts in a CQL2 filter."""
+            url = f"{CDSE_STAC_URL.rstrip('/')}/collections/{coll}/queryables"
+            try:
+                with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT[1]) as response:
+                    return set(json.load(response).get("properties", {}))
+            except Exception as exc:
+                print(f"warning: cannot read {url} ({exc}); filtering client-side only")
+                return set()
+
+
+        def find_product_asset(item):
+            for asset in item.assets.values():
+                roles = asset.roles or []
+                if "data" in roles and "archive" in roles and asset.media_type == "application/zip":
+                    return asset
+            fail(f"no zipped product asset in {item.id}")
+
+
+        def safe_stem(local_path):
+            """SAFE name without .SAFE.zip / .zip / .SAFE (as legacy-datasets safe-to-zarr)."""
+            name = posixpath.basename(local_path)
+            for suffix in (".SAFE.zip", ".zip"):
+                if name.endswith(suffix):
+                    name = name[: -len(suffix)]
+                    break
+            if name.endswith(".SAFE"):
+                name = name[: -len(".SAFE")]
+            return name
+
+
+        def match_key(item_id):
+            """What a Sample Service product must share with a CDSE product to replace it.
+
+            S2: S2C_MSIL2A_20250601T235801_N0511_R030_T57MVR (id without the processing
+                time; keeps the baseline, relative orbit and tile)
+            S3: (S3A_OL_1_EFR____20250601T235909_20250602T000209, "NT", "004"): sensing
+                start/stop, timeliness and baseline, so that a near-real-time (NR)
+                product never stands for a non-time-critical (NT) one.
+            """
+            if item_id.startswith("S2"):
+                return item_id.rsplit("_", 1)[0]
+            if item_id.startswith("S3"):
+                match = S3_TIMELINESS.search(item_id)
+                return (item_id[:47],) + (match.groups() if match else (None, None))
+            return item_id
+
+
+        def processing_time(item_id):
+            """Processing (S2) or creation (S3) time: the latest product wins."""
+            if item_id.startswith("S2"):
+                return item_id.rsplit("_", 1)[-1]
+            if item_id.startswith("S3"):
+                return item_id[48:63]
+            return item_id
+
+
+        def product_type(item_id):
+            if item_id.startswith("S2"):
+                return item_id.split("_")[1]  # MSIL2A
+            if item_id.startswith("S3"):
+                return item_id[4:15].rstrip("_")  # OL_1_EFR
+            fail(f"cannot derive the product type from {item_id}")
+
+
+        def sensing_start(item_id):
+            if item_id.startswith("S2"):
+                return item_id.split("_")[2]
+            if item_id.startswith("S3"):
+                return item_id[16:31]
+            fail(f"cannot derive the sensing start from {item_id}")
+
+
+        def relative_orbit_of(item):
+            value = item.properties.get("sat:relative_orbit")
+            if value is not None:
+                return int(value)
+            if item.id.startswith("S2"):
+                return int(item.id.split("_")[4][1:])  # R051
+            if item.id.startswith("S3"):
+                return int(item.id[73:76])  # ..._0179_145_024_... (cycle 145, orbit 024)
+            return None
+
+
+        def platform_code(platform_name, first_id):
+            match = re.fullmatch(r"sentinel-(\d)([a-z])", (platform_name or "").lower())
+            if match:
+                return f"S{match.group(1)}{match.group(2).upper()}"
+            return first_id[:3]
+
+
+        def search_orbit(client, platform_name, rel_orbit, dt, bbox_list, limit_items):
+            queryables = server_queryables(collection)
+            filter_args = []
+            if platform_name and "platform" in queryables:
+                filter_args.append({"op": "=", "args": [{"property": "platform"}, platform_name]})
+            if rel_orbit is not None and "sat:relative_orbit" in queryables:
+                filter_args.append(
+                    {"op": "=", "args": [{"property": "sat:relative_orbit"}, rel_orbit]}
+                )
+            kwargs = dict(collections=[collection], datetime=dt, bbox=bbox_list, limit=200,
+                          max_items=limit_items)
+            if filter_args:
+                kwargs["filter_lang"] = "cql2-json"
+                kwargs["filter"] = (
+                    {"op": "and", "args": filter_args} if len(filter_args) > 1 else filter_args[0]
+                )
+            print(f"CDSE search: datetime={dt} bbox={bbox_list} filter={kwargs.get('filter')}")
+            return list(client.search(**kwargs).items())
+
+
+        def match_sample_service(items, eopf_collection):
+            """{cdse item id: EOPF Zarr href} for the products on the Sample Service.
+
+            One search over the orbit (time span +-5 min, union of the item bboxes)
+            instead of one get_item + one search per item; then, per item, the same
+            rules as legacy-datasets download_orbit_after_checking_sample_service.py:
+            same id first, else the same match_key with a datetime within +-5 min,
+            latest processing first. A key shared by two CDSE products (S2 tile split
+            at a datatake boundary) is ambiguous: no key match for those.
+            """
+            times = [parse_dt(i.properties["datetime"]) for i in items]
+            dt = (f"{(min(times) - SAMPLE_SERVICE_WINDOW).isoformat()}/"
+                  f"{(max(times) + SAMPLE_SERVICE_WINDOW).isoformat()}")
+            boxes = [i.bbox for i in items if i.bbox]
+            union = ([min(b[0] for b in boxes), min(b[1] for b in boxes),
+                      max(b[2] for b in boxes), max(b[3] for b in boxes)] if boxes else None)
+            try:
+                eopf = open_client(EOPF_STAC_URL)
+                candidates = [c for c in eopf.search(collections=[eopf_collection], datetime=dt,
+                                                     bbox=union, limit=200).items()
+                              if "product" in c.assets]
+            except Exception as exc:
+                print(f"warning: Sample Service search failed ({exc}); everything comes from CDSE")
+                return {}
+            print(f"Sample Service: {len(candidates)} {eopf_collection} items in {dt}")
+
+            by_id = {c.id: c for c in candidates}
+            by_key = {}
+            for cand in sorted(candidates, key=lambda c: (processing_time(c.id), c.id)):
+                by_key[match_key(cand.id)] = cand  # latest processing wins
+            keys = Counter(match_key(i.id) for i in items)
+            hrefs = {}
+            for item in items:
+                match = by_id.get(item.id)
+                key = match_key(item.id)
+                if match is None and keys[key] == 1:
+                    cand = by_key.get(key)
+                    t0 = parse_dt(item.properties["datetime"])
+                    if (cand is not None and cand.datetime is not None
+                            and abs(cand.datetime - t0) <= SAMPLE_SERVICE_WINDOW):
+                        match = cand
+                if match is not None:
+                    hrefs[item.id] = match.assets["product"].href
+            return hrefs
+
+
+        # ---- band mode -------------------------------------------------------------------
+        def sensing_span(item):
+            """(start, end) of an item: start_/end_datetime, else datetime (S2: the datatake
+            start, shared by every tile of the datatake)."""
+            p = item.properties
+            return (parse_dt(p.get("start_datetime") or p["datetime"]),
+                    parse_dt(p.get("end_datetime") or p["datetime"]))
+
+
+        def join_split_passes(groups, spans, lons):
+            """Join groups of item ids that are one pass cut by a gap along the track: their
+            sensing time ranges are within PASS_TIME_GAP and their longitude ranges overlap
+            (the two crossings of a band lie far apart in longitude)."""
+            groups = [set(g) for g in groups]
+
+            def span(ids):
+                return min(spans[k][0] for k in ids), max(spans[k][1] for k in ids)
+
+            def lon_range(ids):
+                return min(lons[k][0] for k in ids), max(lons[k][1] for k in ids)
+
+            joined = True
+            while joined:
+                joined = False
+                for a in range(len(groups)):
+                    for b in range(a + 1, len(groups)):
+                        (s0, e0), (s1, e1) = span(groups[a]), span(groups[b])
+                        (x0, x1), (x2, x3) = lon_range(groups[a]), lon_range(groups[b])
+                        if max(s0, s1) - min(e0, e1) <= PASS_TIME_GAP and x0 <= x3 and x2 <= x1:
+                            groups[a] |= groups.pop(b)
+                            joined = True
+                            break
+                    if joined:
+                        break
+            return groups
+
+
+        def cell_size_deg(level):
+            """Angular size (deg) of a HEALPix cell: sqrt(4 pi / (12 * 4**level)) rad."""
+            return math.degrees(math.sqrt(math.pi / 3)) / 2**level
+
+
+        def band_search_bbox(lat_band, level):
+            """Search bbox of band mode: the band over all longitudes, widened by 2 cells so
+            that the products under the cells that stick out of the band are found."""
+            margin = 2 * cell_size_deg(level)
+            return [-180.0, max(-90.0, lat_band[0] - margin), 180.0, min(90.0, lat_band[1] + margin)]
+
+
+        def footprint(item):
+            from shapely.geometry import box, shape
+
+            geom = shape(item.geometry) if item.geometry else box(*item.bbox)
+            if not geom.is_valid:
+                geom = geom.buffer(0)
+            return geom
+
+
+        def cell_polygons(cells, level, hpx_nested, step):
+            """Shapely polygons (lon -180..180) of HEALPix cells with `step` vertices per
+            side (1 = the 4 corners), and the latitudes of their vertices."""
+            import numpy as np
+            from shapely.geometry import Polygon
+
+            lon, lat = hpx_nested.vertices(cells, level, ellipsoid=HEALPIX_ELLIPSOID, step=step)
+            lon = np.asarray(lon, dtype="float64").reshape(len(cells), -1)
+            lat = np.asarray(lat, dtype="float64").reshape(len(cells), -1)
+            lon = (lon + 180.0) % 360.0 - 180.0  # healpix_geo returns 0..360
+            wraps = lon.max(axis=1) - lon.min(axis=1) > 180.0  # cell across the antimeridian
+            lon[wraps] = np.where(lon[wraps] < 0, lon[wraps] + 360.0, lon[wraps])
+            # neighbouring cells get bit-identical shared vertices, so that the union of
+            # the kept cells has no slivers
+            lon, lat = np.round(lon, 9), np.round(lat, 9)
+            return [Polygon(np.column_stack([x, y])) for x, y in zip(lon, lat)], lat
+
+
+        def select_band(items, ref_id, bbox_list, lat_band, level, rule):
+            """(items, output_extent, extent_info) of band mode, see the template header.
+
+            items: the products of ONE absolute orbit found in band_search_bbox.
+            """
+            import numpy as np
+            from shapely.geometry import Polygon, box
+            from shapely.geometry.polygon import orient
+            from shapely.ops import unary_union
+            from shapely.prepared import prep
+
+            try:
+                import healpix_geo.nested as hpx_nested  # only needed in band mode
+            except ImportError as exc:
+                fail(f"band mode (lat_range) needs healpix-geo in healpix_image: {exc}")
+
+            lat_min, lat_max = lat_band
+            band = box(-180.0, lat_min, 180.0, lat_max)
+            search = box(*band_search_bbox(lat_band, level))
+            feet = {i.id: footprint(i) for i in items}
+
+            # 1. passes over the band: connected parts of the footprints in the search band
+            #    (an orbit crosses a latitude twice, day and night halves), joined when their
+            #    sensing times are close and their longitudes overlap (a gap along the track
+            #    must not split a pass)
+            clipped = {k: g.intersection(search) for k, g in feet.items()}
+            clipped = {k: g for k, g in clipped.items() if not g.is_empty}
+            merged = unary_union([g.buffer(COMPONENT_TOLERANCE) for g in clipped.values()])
+            groups = []
+            for part in getattr(merged, "geoms", [merged]):
+                ids = {k for k, g in clipped.items() if part.intersects(g)}
+                # a footprint split at the antimeridian (MultiPolygon) joins its two sides
+                for other in [g for g in groups if g & ids]:
+                    groups.remove(other)
+                    ids |= other
+                if ids:
+                    groups.append(ids)
+            groups = join_split_passes(groups, {i.id: sensing_span(i) for i in items},
+                                       {k: (g.bounds[0], g.bounds[2]) for k, g in clipped.items()})
+            start = {i.id: (parse_dt(i.properties["datetime"]), i.id) for i in items}
+            passes = []
+            for ids in sorted(groups, key=lambda g: min(start[k] for k in g)):
+                swath = unary_union([clipped[k] for k in ids]).intersection(band)
+                if swath.area > 0:
+                    passes.append({"ids": ids, "swath": swath})
+            if not passes:
+                fail(f"no product of the orbit covers the latitude band {lat_min}..{lat_max}")
+            for n, p in enumerate(passes):
+                x0, y0, x1, y1 = p["swath"].bounds
+                t0 = min(start[k] for k in p["ids"])[0]
+                print(f"pass {n}: {len(p['ids'])} products from {t0:%Y-%m-%dT%H:%M:%S}, band part "
+                      f"lon {x0:.3f}..{x1:.3f} lat {y0:.3f}..{y1:.3f}")
+
+            chosen = [p for p in passes if ref_id in p["ids"]] if ref_id else []
+            if ref_id and not chosen:
+                print(f"note: the reference item {ref_id} is outside the latitude band; "
+                      "the pass is chosen with bbox")
+            if not chosen and bbox_list:
+                area = box(*bbox_list)
+                chosen = [p for p in passes if p["swath"].intersects(area)]
+                if not chosen:
+                    fail(f"bbox {bbox_list} intersects none of the {len(passes)} passes of the orbit "
+                         f"over the latitude band")
+            elif not chosen:
+                chosen = passes
+            if len(chosen) > 1:
+                fail(f"the orbit crosses the latitude band {len(chosen)} times (passes listed above); "
+                     "set bbox to a box that intersects only the wanted pass")
+            swath = chosen[0]["swath"]
+            for n, p in enumerate(passes):
+                if p is chosen[0]:
+                    continue
+                x0, _, x1, _ = p["swath"].bounds
+                if x0 <= swath.bounds[2] and x1 >= swath.bounds[0]:
+                    # the two crossings of a band lie far apart in longitude; one beside or
+                    # below the chosen pass is more likely the same pass cut by a gap
+                    print(f"WARNING: pass {n} ({len(p['ids'])} products) is left out although it "
+                          "overlaps the chosen pass in longitude: a gap along the track?")
+                else:
+                    print(f"note: pass {n} ({len(p['ids'])} products) is left out")
+            if swath.bounds[0] <= -180 + 1e-9 or swath.bounds[2] >= 180 - 1e-9:
+                fail("the pass crosses the antimeridian: not supported (healpix-convert needs one "
+                     "polygon in lon -180..180)")
+
+            # 2./3. cells of align_level over the swath
+            cover = hpx_nested.zone_coverage(tuple(swath.bounds), level, ellipsoid=HEALPIX_ELLIPSOID,
+                                             flat=True)
+            cells = np.unique(np.asarray(cover[0] if isinstance(cover, tuple) else cover, dtype="uint64"))
+            polygons, vertex_lats = cell_polygons(cells, level, hpx_nested, VERTEX_STEP)
+            test = prep(swath)
+            keep = np.array([
+                (rule == "intersects" or (lats.min() >= lat_min - 1e-9 and lats.max() <= lat_max + 1e-9))
+                and test.intersects(poly)
+                for poly, lats in zip(polygons, vertex_lats)
+            ], dtype=bool)
+            if not keep.any():
+                fail(f"no level-{level} cell kept with align_rule={rule} (band too narrow for "
+                     "'within'? lower align_level or use 'intersects')")
+            kept = cells[keep]
+
+            # 4. region = union of the kept cells, ONE polygon; healpix-convert reads one
+            #    ring only (shapely.get_coordinates), so holes (gaps in the swath, no input
+            #    data there) are filled
+            def one_polygon(geom):
+                if geom.geom_type != "Polygon":
+                    parts = [tuple(round(v, 3) for v in g.bounds) for g in getattr(geom, "geoms", [])]
+                    fail(f"the {len(kept)} kept level-{level} cells form a {geom.geom_type} of "
+                         f"{len(parts)} parts (bounds {parts}); healpix-convert needs one polygon "
+                         "(a gap along the track wider than a cell?)")
+                return Polygon(geom.exterior)
+
+            union = unary_union([p for p, k in zip(polygons, keep) if k])
+            region = one_polygon(union)
+            # the cells in the holes are converted too (output_extent has no holes): count
+            # them as kept, so that n_cells and the checks below match what is converted
+            inside = prep(region)
+            filled = np.array([not k and inside.contains(p.representative_point())
+                               for p, k in zip(polygons, keep)], dtype=bool)
+            if filled.any():
+                keep |= filled
+                kept = cells[keep]
+                print(f"note: the holes of the region (gaps in the swath) are filled: "
+                      f"{int(filled.sum())} more level-{level} cells")
+            if not box(*band_search_bbox(lat_band, level)).contains(region):
+                fail("the region sticks out of the search band; products may be missing")
+
+            # output_extent: the same cells through their corners, EXTENT_INSET inwards
+            corners, _ = cell_polygons(kept, level, hpx_nested, 1)
+            extent = one_polygon(unary_union(corners)).buffer(-EXTENT_INSET, join_style="mitre")
+            if extent.geom_type != "Polygon" or extent.is_empty:
+                fail(f"output_extent is a {extent.geom_type} after the {EXTENT_INSET} deg inset")
+            extent = orient(extent, 1.0)  # counter-clockwise exterior (RFC 7946)
+            ring = [[round(x, EXTENT_DECIMALS), round(y, EXTENT_DECIMALS)] for x, y in extent.exterior.coords]
+            geojson = {"type": "Polygon", "coordinates": [ring]}
+            rounded = Polygon(ring)
+            if not rounded.is_valid:
+                from shapely.validation import explain_validity
+
+                fail(f"output_extent is invalid after rounding: {explain_validity(rounded)}")
+            # the cells healpix-convert derives from it (compute_output_chunk_info): at the
+            # finest affordable level up to CHECK_LEVEL, against the children of the kept cells
+            check_level = level
+            while (check_level < CHECK_LEVEL
+                   and kept.size * 4 ** (check_level + 1 - level) <= CHECK_MAX_CELLS):
+                check_level += 1
+            d = check_level - level
+            expected = (kept[:, None] * np.uint64(4**d) + np.arange(4**d, dtype="uint64")).ravel()
+            covered = hpx_nested.polygon_coverage(np.asarray(rounded.exterior.coords), check_level,
+                                                  ellipsoid=HEALPIX_ELLIPSOID, flat=True)
+            covered = np.unique(np.asarray(covered[0] if isinstance(covered, tuple) else covered,
+                                           dtype="uint64"))
+            extra, missing = np.setdiff1d(covered, expected), np.setdiff1d(expected, covered)
+            if extra.size or missing.size:
+                print(f"WARNING: polygon_coverage of output_extent at level {check_level} gives "
+                      f"{extra.size} cells outside the {kept.size} kept level-{level} cells and misses "
+                      f"{missing.size} of their {expected.size} children: chunks of that level along "
+                      "the cell edges would be added or lost (use a finer align_level)")
+            if check_level < CHECK_LEVEL:
+                print(f"note: output_extent checked at level {check_level} only (level {CHECK_LEVEL} "
+                      f"would be {kept.size * 4 ** (CHECK_LEVEL - level)} cells); stage-cache checks "
+                      "the chunk counts")
+
+            # 5. the products of the pass under the region
+            under = prep(region)
+            selected = [i for i in items if i.id in chosen[0]["ids"] and under.intersects(feet[i.id])]
+            x0, y0, x1, y1 = region.bounds
+            info = {
+                "mode": "band",
+                "lat_range": [lat_min, lat_max],
+                "align_level": level,
+                "align_rule": rule,
+                "ellipsoid": HEALPIX_ELLIPSOID,
+                "indexing_scheme": HEALPIX_INDEXING,
+                "n_cells": int(kept.size),
+                "lat_min_actual": round(y0, EXTENT_DECIMALS),
+                "lat_max_actual": round(y1, EXTENT_DECIMALS),
+                "lon_min_actual": round(x0, EXTENT_DECIMALS),
+                "lon_max_actual": round(x1, EXTENT_DECIMALS),
+            }
+            print(f"band {lat_min}..{lat_max}: {kept.size} of {cells.size} level-{level} cells "
+                  f"({rule}), region lon {x0:.4f}..{x1:.4f} lat {y0:.4f}..{y1:.4f}; output_extent "
+                  f"{len(ring)} vertices, polygon_coverage at level {check_level}: {covered.size} cells; "
+                  f"{len(selected)} of {len(items)} products under the region")
+            return selected, geojson, info
+
+
+        def main():
+            g4e_collection = G4E_COLLECTIONS.get(collection)
+            if g4e_collection is None:
+                fail(f"unsupported collection {collection!r}; known: {sorted(G4E_COLLECTIONS)}")
+            limit_items = parse_int("max_items", max_items) or 1000
+            lat_band, lat_preset = parse_lat_range(lat_range)
+            level = parse_align_level(align_level)
+            rule = parse_align_rule(align_rule)
+            bbox_list, bbox_preset = parse_bbox(bbox)
+            # band mode: the band names the output and bbox only picks the pass
+            region = resolve_region_name(region_name, lat_band, lat_preset, bbox_preset)
+            print(f"region tag: {region}")
+            if check_sample_service.strip().lower() not in ("true", "false"):
+                fail(f"check_sample_service must be 'true' or 'false', got {check_sample_service!r}")
+            client = open_client(CDSE_STAC_URL)
+
+            if reference_item.strip():
+                manual = [name for name, value in (
+                    ("platform", platform), ("relative_orbit", relative_orbit),
+                    ("absolute_orbit", absolute_orbit), ("datetime", datetime_range),
+                ) if value.strip()]
+                if manual:
+                    fail(f"reference_item sets the orbit; leave {', '.join(manual)} empty")
+                # a network or API error raises (exit 1, retried); only a missing item fails
+                ref = client.get_collection(collection).get_item(reference_item.strip())
+                if ref is None:
+                    fail(f"reference item {reference_item!r} not found in CDSE collection {collection}")
+                p = ref.properties
+                plat = p["platform"]
+                abs_orbit = int(p["sat:absolute_orbit"])
+                rel_orbit = relative_orbit_of(ref)
+                t0 = parse_dt(p["datetime"])
+                dt = f"{(t0 - ORBIT_PERIOD).isoformat()}/{(t0 + ORBIT_PERIOD).isoformat()}"
+                ref_id = ref.id
+                print(f"reference: {ref.id}\n  platform={plat} absolute_orbit={abs_orbit} "
+                      f"relative_orbit={rel_orbit}\n  datetime window={dt}")
+            else:
+                if not datetime_range.strip():
+                    fail("give reference_item, or datetime (+ platform / relative_orbit / absolute_orbit)")
+                plat = platform.strip()
+                rel_orbit = parse_int("relative_orbit", relative_orbit)
+                abs_orbit = parse_int("absolute_orbit", absolute_orbit)
+                dt = datetime_range.strip()
+                ref_id = None
+                print(f"manual selection: platform={plat or '-'} relative_orbit={rel_orbit} "
+                      f"absolute_orbit={abs_orbit} datetime={dt}")
+
+            if lat_band:
+                print(f"band mode: lat {lat_band[0]}..{lat_band[1]}, align_level={level} ({rule}); "
+                      f"bbox {bbox_list or '-'} only picks the pass")
+            search_bbox = band_search_bbox(lat_band, level) if lat_band else bbox_list
+            found = search_orbit(client, plat, rel_orbit, dt, search_bbox, limit_items)
+            if len(found) >= limit_items:
+                fail(f"the search hit max_items={limit_items}; the orbit may be incomplete, "
+                     "raise max_items or narrow bbox/datetime")
+
+            items = {}
+            for item in found:
+                p = item.properties
+                if abs_orbit is not None and p.get("sat:absolute_orbit") != abs_orbit:
+                    continue
+                if plat and p.get("platform") != plat:
+                    continue
+                if rel_orbit is not None and p.get("sat:relative_orbit") not in (None, rel_orbit):
+                    continue
+                items[item.id] = item
+            items = sorted(items.values(), key=lambda i: (parse_dt(i.properties["datetime"]), i.id))
+
+            orbits = Counter((i.properties.get("platform"), i.properties.get("sat:absolute_orbit"))
+                             for i in items)
+            print(f"{len(found)} CDSE items in the window, {len(items)} after filtering; "
+                  f"(platform, absolute orbit): {dict(orbits)}")
+            if not items:
+                fail("no CDSE item matches: check collection, bbox, datetime and the orbit numbers")
+            if len(orbits) != 1:
+                fail(f"expected exactly one absolute orbit, found {len(orbits)}: {dict(orbits)}. "
+                     "Use reference_item, or set platform and absolute_orbit.")
+            (plat, orbit), = orbits
+            orbit = int(orbit)
+            rel_orbits = {relative_orbit_of(i) for i in items} - {None}
+            if len(rel_orbits) != 1:
+                fail(f"expected one relative orbit, found {sorted(rel_orbits)}")
+            rel_orbit = rel_orbits.pop()
+
+            if lat_band:
+                items, extent, extent_info = select_band(items, ref_id, bbox_list, lat_band, level, rule)
+                if not items:
+                    fail("no product of the orbit intersects the band region")
+                output_extent = json.dumps(extent, separators=(",", ":"))
+            else:
+                output_extent = ""
+                extent_info = {"mode": "bbox" if bbox_list else "orbit", "bbox": bbox_list}
+
+            if collection.startswith("sentinel-2"):
+                tiles = Counter(i.id.split("_")[5] for i in items)
+                dups = sorted(t for t, n in tiles.items() if n > 1)
+                if dups:
+                    print(f"note: {len(dups)} tiles have 2 products (datatake boundary), "
+                          f"both kept: {', '.join(dups)}")
+
+            eopf_hrefs = {}
+            if check_sample_service.strip().lower() == "true":
+                eopf_hrefs = match_sample_service(items, g4e_collection)
+                if eopf_hrefs and len(eopf_hrefs) < len(items):
+                    print(f"note: the Sample Service has {len(eopf_hrefs)} of the {len(items)} "
+                          "products; all of them are taken from CDSE (Sample Service stores and "
+                          "CDSE conversions cannot be merged into one HEALPix dataset)")
+                    eopf_hrefs = {}
+
+            prefix = mirror_prefix.rstrip("/")
+            records = []
+            for item in items:
+                asset = find_product_asset(item)
+                local_path = asset.extra_fields.get("file:local_path") or f"{item.id}.zip"
+                records.append({
+                    "id": item.id,
+                    "datetime": item.properties["datetime"],
+                    "href": asset.href,
+                    "checksum": asset.extra_fields.get("file:checksum", ""),
+                    "size": int(asset.extra_fields.get("file:size") or 0),
+                    "safe_name": posixpath.basename(local_path),
+                    "mirror_path": f"{prefix}/{g4e_collection}/{safe_stem(local_path)}.zarr",
+                    "eopf_href": eopf_hrefs.get(item.id, ""),
+                })
+            for r in records:
+                source = "eopf" if r["eopf_href"] else "cdse"
+                print(f"[{source}] {r['datetime']} {r['id']} -> {r['mirror_path']}")
+            n_eopf = sum(bool(r["eopf_href"]) for r in records)
+            print(f"{len(records)} items: {n_eopf} from the EOPF Sample Service, "
+                  f"{len(records) - n_eopf} from CDSE")
+
+            first_id = items[0].id
+            parts = [platform_code(plat, first_id), product_type(first_id),
+                     min(sensing_start(i.id) for i in items), f"R{rel_orbit:03d}", f"O{orbit}", region]
+            healpix_name = "_".join(parts)
+            healpix_output_path = f"{converted_prefix.rstrip('/')}/{g4e_collection}/{healpix_name}.zarr"
+            orbit_info = {
+                "platform": plat,
+                "absolute_orbit": orbit,
+                "relative_orbit": rel_orbit,
+                "collection": collection,
+                "g4e_collection": g4e_collection,
+                "n_items": len(records),
+                "datetime_start": records[0]["datetime"],
+                "region": region,
+            }
+            print("orbit:", json.dumps(orbit_info))
+            print("healpix_name:", healpix_name)
+            print("healpix_output_path:", healpix_output_path)
+            print("extent_info:", json.dumps(extent_info))
+            print(f"output_extent: {len(output_extent)} characters")
+
+            compact = dict(separators=(",", ":"))
+            write_output("items.json", json.dumps(records, **compact))
+            write_output("mirror_paths.json", json.dumps([r["mirror_path"] for r in records], **compact))
+            write_output("orbit.json", json.dumps(orbit_info, **compact))
+            write_output("healpix_name.txt", healpix_name)
+            write_output("healpix_output_path.txt", healpix_output_path)
+            write_output("output_extent.json", output_extent)
+            write_output("extent_info.json", json.dumps(extent_info, **compact))
+
+
+        if __name__ == "__main__":
+            main()
+
+  - name: mirror-item
+    inputs:
+      parameters:
+        - name: item
+        - name: s3_endpoint
+        - name: eopf_image
+    # up to 5 attempts, 2, 4, 8 and 16 min apart (pod eviction, node loss, S3 or
+    # proxy errors outside the download loop); backoff.maxDuration counts from the
+    # start of the first attempt: Argo starts no retry after 2 h.
+    retryStrategy:
+      limit: "4"
+      retryPolicy: Always
+      # exit code 2 = no CDSE credentials: retrying cannot help
+      expression: 'lastRetry.exitCode != "2"'
+      backoff:
+        duration: "2m"
+        factor: "2"
+        maxDuration: "2h"
+    # Deadline of ONE attempt, sized for a pessimistic 2 MiB/s (2097152 B/s) link
+    # and a 1.3 GB SAFE (T31UDQ of orbit 4025: 1.22 GB):
+    #   3 full downloads (DOWNLOAD_ATTEMPTS; CDSE answers 416 to Range, so every
+    #   download restarts from zero): 3 x 1.3e9 B / 2 MiB/s = 3 x 620 s    = 1860 s
+    #   the 2 failed ones may first stall for the read timeout
+    #   (HTTP_TIMEOUT 600 s each) + the pauses between them (30 s + 60 s)  = 1290 s
+    #   eopf convert (~40 s measured for that S2 L2A tile; S3 budgeted)    =  900 s
+    #   upload of the ~1.2 GB store at the same 2 MiB/s                    =  620 s
+    #   total 4670 s, x 1.5 margin = 7005 s -> 7200 s (2 h = backoff.maxDuration:
+    #   an attempt that runs out of time is not retried).
+    # CDSE quota waits (429 / 503, only when another client uses the account at
+    # the same time) come out of the same budget. Also bounds a pod stuck in
+    # ContainerCreating or ImagePullBackOff.
+    activeDeadlineSeconds: 7200
+    volumes:
+      - name: work
+        emptyDir:
+          sizeLimit: 40Gi
+      - name: s3-creds
+        secret:
+          secretName: argo-s3-credentials
+      - name: cdse-creds
+        secret:
+          secretName: argo-cdse-credentials
+          # checked by the script, so that a missing secret fails the product at
+          # once instead of keeping the pod in ContainerCreating
+          optional: true
+    script:
+      image: "{{inputs.parameters.eopf_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        limits:
+          cpu: "4"
+          memory: 16Gi
+        requests:
+          cpu: "4"
+          memory: 16Gi
+      volumeMounts:
+        - name: work
+          mountPath: /work
+        - name: s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+        - name: cdse-creds
+          readOnly: true
+          mountPath: /etc/cdse
+      source: |
+        """Mirror one product into eopf-mirror as EOPF Zarr.
+
+        A store is complete when its root zarr.json has the stac_discovery attribute;
+        complete stores are skipped. Otherwise the store is built under WORK_DIR (copy
+        of the Sample Service Zarr, or CDSE SAFE download + eopf convert), its STAC id
+        is set to the product name (unique, unlike the eopf id), whatever a failed
+        attempt left at the destination is deleted, and the store is uploaded: first a
+        placeholder root zarr.json without stac_discovery (stac-scraper skips such a
+        store), then the arrays, then the real root metadata.
+        """
+        import hashlib
+        import json
+        import os
+        import posixpath
+        import re
+        import shutil
+        import sys
+        import time
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        from concurrent.futures import ThreadPoolExecutor
+
+        import fsspec
+
+        try:
+            import requests
+        except ImportError:
+            requests = None
+
+        item_json = r"""{{inputs.parameters.item}}"""
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        S3_CREDS_DIR = "/etc/s3"
+        CDSE_CREDS_DIR = "/etc/cdse"
+        WORK_DIR = "/work"
+        OIDC_DISCOVERY_URL = (
+            "https://identity.dataspace.copernicus.eu"
+            "/auth/realms/CDSE/.well-known/openid-configuration"
+        )
+        CDSE_CLIENT_ID = "cdse-public"
+        # the bearer token is only ever sent to this domain and its subdomains
+        AUTH_DOMAIN = "dataspace.copernicus.eu"
+        # objects written under these prefixes are public-read, like every object of
+        # the public area of the bucket
+        PUBLIC_READ_PREFIXES = ("s3://grid4earth/public/",)
+        EXIT_INVALID = 2  # not retried by the retryStrategy
+        BLOCK_SIZE = 8 * 2**20
+        DOWNLOAD_ATTEMPTS = 3
+        # CDSE quota (4 concurrent connections per account): HTTP 429 / 503 wait for
+        # Retry-After (default RATE_LIMIT_WAIT s) without using a download attempt
+        RATE_LIMIT_CODES = (429, 503)
+        RATE_LIMIT_WAIT = 120
+        RATE_LIMIT_MAX_WAIT = 900
+        RATE_LIMIT_RETRIES = 15
+        TOKEN_MAX_AGE = 300  # s, CDSE access tokens are valid for 10 min
+        HTTP_TIMEOUT = (60, 600)  # requests (connect, read) timeouts, s: slow links
+        URLLIB_TIMEOUT = 120  # s, small JSON requests (OIDC discovery, token)
+        # botocore settings of the S3 client: slow links, proxy 502 / timeouts
+        S3_CONFIG = {"connect_timeout": 120, "read_timeout": 600,
+                     "retries": {"max_attempts": 10, "mode": "adaptive"}}
+        UPLOAD_WORKERS = 16
+        REDIRECT_CODES = (301, 302, 303, 307, 308)
+        # multihash codes -> hashlib names (CDSE uses md5, 0xd5)
+        MULTIHASH_CODES = {0xD5: "md5", 0x11: "sha1", 0x12: "sha256", 0x13: "sha512"}
+        # zarr-v2 codec settings of the Sample Service stores; zarr v3 picks its own
+        ZARR_ENCODING_KEYS = (
+            "compressor", "compressors", "filters", "serializer", "shards", "chunks",
+            "preferred_chunks", "object_codec", "write_empty_chunks", "dimension_separator",
+            "chunk_key_encoding",
+        )
+        ROOT_METADATA = (".zattrs", ".zgroup", ".zmetadata", "zarr.json")  # uploaded last, in this order
+        PLACEHOLDER = {"zarr_format": 3, "node_type": "group",
+                       "attributes": {"g4e_mirror": "upload in progress"}}
+
+        _token = {"value": None, "time": 0.0}
+
+
+        def fail(message):
+            print(f"ERROR: {message}", file=sys.stderr, flush=True)
+            sys.exit(EXIT_INVALID)
+
+
+        def read_secret(directory, key):
+            with open(os.path.join(directory, key)) as f:
+                return f.read().strip()
+
+
+        def storage_options_for(url):
+            if not url.startswith("s3://"):
+                return {}
+            options = {
+                "key": read_secret(S3_CREDS_DIR, "accessKey"),
+                "secret": read_secret(S3_CREDS_DIR, "secretKey"),
+                "client_kwargs": {"endpoint_url": s3_endpoint},
+                "config_kwargs": dict(S3_CONFIG),
+            }
+            if url.startswith(PUBLIC_READ_PREFIXES):
+                options["s3_additional_kwargs"] = {"ACL": "public-read"}
+            return options
+
+
+        def get_fs(url):
+            return fsspec.core.url_to_fs(url, **storage_options_for(url))
+
+
+        def redact(text):
+            """Drop query strings (signed redirect URLs) from messages."""
+            return re.sub(r"\?[^\s'\"]*", "?...", str(text))
+
+
+        def host_of(url):
+            return (urllib.parse.urlsplit(url).hostname or "").lower()
+
+
+        def auth_allowed(url):
+            host = host_of(url)
+            return urllib.parse.urlsplit(url).scheme == "https" and (
+                host == AUTH_DOMAIN or host.endswith("." + AUTH_DOMAIN))
+
+
+        # ---- completeness of the destination --------------------------------------
+        def root_metadata(fs, root):
+            """The destination's root zarr.json as a dict, None when absent or unreadable."""
+            try:
+                return json.loads(fs.cat_file(posixpath.join(root, "zarr.json")))
+            except (FileNotFoundError, ValueError):
+                return None
+
+
+        def is_complete(metadata):
+            attributes = (metadata or {}).get("attributes") or {}
+            return isinstance(attributes.get("stac_discovery"), dict)
+
+
+        def remove_partial(fs, root):
+            """Delete what a failed attempt left at root (an incomplete store)."""
+            if not root.rstrip("/").endswith(".zarr"):
+                raise RuntimeError(f"refusing to delete {root}: not a .zarr store")
+            if fs.exists(root):
+                print(f"removing the incomplete store left by a previous attempt: {root}")
+                fs.rm(root, recursive=True)
+                fs.invalidate_cache()
+
+
+        # ---- CDSE download ------------------------------------------------------
+        def require_cdse_credentials():
+            missing = [k for k in ("username", "password")
+                       if not os.path.isfile(os.path.join(CDSE_CREDS_DIR, k))]
+            if missing:
+                fail(f"no CDSE credentials ({', '.join(missing)}) in {CDSE_CREDS_DIR}: create the "
+                     "argo-cdse-credentials secret (keys username, password) in the argo namespace")
+
+
+        def http_json(url, data=None):
+            with urllib.request.urlopen(urllib.request.Request(url, data=data),
+                                        timeout=URLLIB_TIMEOUT) as r:
+                return json.load(r)
+
+
+        def cdse_token():
+            """Access token (OAuth2 password grant, client cdse-public), reused for
+            TOKEN_MAX_AGE seconds so that retries do not open new sessions."""
+            if _token["value"] and time.monotonic() - _token["time"] < TOKEN_MAX_AGE:
+                return _token["value"]
+            token_url = http_json(OIDC_DISCOVERY_URL)["token_endpoint"]
+            form = urllib.parse.urlencode({
+                "grant_type": "password",
+                "client_id": CDSE_CLIENT_ID,
+                "username": read_secret(CDSE_CREDS_DIR, "username"),
+                "password": read_secret(CDSE_CREDS_DIR, "password"),
+            }).encode()
+            try:
+                value = http_json(token_url, form)["access_token"]
+            except urllib.error.HTTPError as exc:
+                raise RuntimeError(f"CDSE token request failed: HTTP {exc.code}") from None
+            _token.update(value=value, time=time.monotonic())
+            return value
+
+
+        class RateLimited(Exception):
+            """HTTP 429 / 503: wait `wait` seconds, then try again."""
+
+            def __init__(self, status, host, wait):
+                super().__init__(f"HTTP {status} from {host}")
+                self.wait = wait
+
+
+        def retry_after(headers):
+            try:
+                return min(max(int(headers.get("Retry-After", "")), 1), RATE_LIMIT_MAX_WAIT)
+            except (AttributeError, TypeError, ValueError):
+                return RATE_LIMIT_WAIT
+
+
+        def expected_digest(checksum):
+            """(hashlib name, digest) from a hex multihash: varint code, varint length, digest."""
+            if not checksum:
+                return None, None
+            raw = bytes.fromhex(checksum)
+            pos = 0
+
+            def varint():
+                nonlocal pos
+                value = shift = 0
+                while True:
+                    byte = raw[pos]
+                    pos += 1
+                    value |= (byte & 0x7F) << shift
+                    shift += 7
+                    if not byte & 0x80:
+                        return value
+
+            code = varint()
+            length = varint()
+            digest = raw[pos:pos + length]
+            if code not in MULTIHASH_CODES or len(digest) != length:
+                raise ValueError(f"unsupported file:checksum {checksum}")
+            return MULTIHASH_CODES[code], digest
+
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None  # -> HTTPError with the 3xx code, handled in open_stream
+
+
+        def check_status(status, url, headers):
+            if status in RATE_LIMIT_CODES:
+                raise RateLimited(status, host_of(url), retry_after(headers))
+            if status in (401, 403):
+                _token["value"] = None  # get a new token for the next attempt
+            if status != 200:
+                raise RuntimeError(f"HTTP {status} from {host_of(url)}")
+
+
+        def open_stream(url, token):
+            """(iterator of blocks, close) for url, following redirects by hand.
+
+            CDSE may redirect download.dataspace.copernicus.eu to another host: requests
+            drops the Authorization header on a cross-host redirect and urllib sends it
+            to any host, so the bearer token is re-added only for https
+            *.dataspace.copernicus.eu.
+            """
+            for _ in range(10):
+                headers = {"Authorization": f"Bearer {token}"} if auth_allowed(url) else {}
+                if requests is not None:
+                    response = requests.get(url, headers=headers, stream=True,
+                                            allow_redirects=False, timeout=HTTP_TIMEOUT)
+                    status = response.status_code
+                    if status in REDIRECT_CODES:
+                        location = response.headers.get("Location", "")
+                        response.close()
+                        url = urllib.parse.urljoin(url, location)
+                        continue
+                    if status != 200:
+                        response.close()
+                    check_status(status, url, response.headers)
+                    return response.iter_content(BLOCK_SIZE), response.close
+                opener = urllib.request.build_opener(_NoRedirect)
+                try:
+                    response = opener.open(urllib.request.Request(url, headers=headers),
+                                           timeout=HTTP_TIMEOUT[1])
+                except urllib.error.HTTPError as exc:
+                    if exc.code in REDIRECT_CODES:
+                        location = exc.headers.get("Location", "")
+                        exc.close()
+                        url = urllib.parse.urljoin(url, location)
+                        continue
+                    exc.close()
+                    check_status(exc.code, url, exc.headers)
+                    raise RuntimeError(f"HTTP {exc.code} from {host_of(url)}") from None
+                return iter(lambda: response.read(BLOCK_SIZE), b""), response.close
+            raise RuntimeError("too many redirects")
+
+
+        def download(href, path, checksum, size):
+            """Download href to path; the CDSE endpoint refuses Range (416), so every
+            attempt starts from zero."""
+            algo, digest = expected_digest(checksum)
+            attempt = waits = 0
+            while True:
+                if os.path.exists(path):
+                    os.remove(path)
+                try:
+                    blocks, close = open_stream(href, cdse_token())
+                    hasher = hashlib.new(algo) if algo else None
+                    nbytes, next_report, t0 = 0, 0, time.monotonic()
+                    try:
+                        with open(path, "wb") as f:
+                            for block in blocks:
+                                f.write(block)
+                                if hasher:
+                                    hasher.update(block)
+                                nbytes += len(block)
+                                if nbytes >= next_report:
+                                    rate = nbytes / 2**20 / max(time.monotonic() - t0, 1e-3)
+                                    print(f"  {nbytes / 2**20:9.0f} / {size / 2**20:.0f} MiB "
+                                          f"({rate:.1f} MiB/s)")
+                                    next_report += 256 * 2**20
+                    finally:
+                        close()
+                    if size and nbytes != size:
+                        raise RuntimeError(f"size mismatch: {nbytes} bytes, expected {size}")
+                    if hasher and hasher.digest() != digest:
+                        raise RuntimeError(f"{algo} mismatch")
+                    print(f"downloaded {nbytes} bytes in {time.monotonic() - t0:.0f} s"
+                          f"{f', {algo} ok' if hasher else ''}")
+                    return
+                except RateLimited as exc:
+                    waits += 1
+                    if waits > RATE_LIMIT_RETRIES:
+                        raise RuntimeError(f"{exc}: still rate-limited after {RATE_LIMIT_RETRIES} waits") from None
+                    print(f"{exc} (CDSE quota): waiting {exc.wait} s ({waits}/{RATE_LIMIT_RETRIES})")
+                    time.sleep(exc.wait)
+                except Exception as exc:
+                    attempt += 1
+                    print(f"download attempt {attempt}/{DOWNLOAD_ATTEMPTS} failed: "
+                          f"{type(exc).__name__}: {redact(exc)}")
+                    if os.path.exists(path):
+                        os.remove(path)
+                    if attempt >= DOWNLOAD_ATTEMPTS:
+                        raise RuntimeError(f"download failed after {DOWNLOAD_ATTEMPTS} attempts") from None
+                    time.sleep(30 * attempt)
+
+
+        def convert_safe(safe_path, zarr_path):
+            """Same calls as legacy-datasets safe-to-zarr/convert.py."""
+            from eopf.config import EOConfiguration
+            from eopf.store.convert import convert
+
+            conf = EOConfiguration()
+            conf.load_default_file()
+            conf._config_internal["dask_context"] = {"cluster_type": "local"}
+            print("eopf convert:", safe_path, "->", zarr_path)
+            convert(os.fspath(safe_path), os.fspath(zarr_path),
+                    target_store_kwargs={"engine": "cpm_zarr"})
+
+
+        # ---- EOPF Sample Service copy --------------------------------------------
+        def copy_sample_service(eopf_href, zarr_path):
+            """Rewrite the Sample Service (zarr v2) store as zarr v3, root attrs included."""
+            import xarray as xr
+
+            print("copying from the Sample Service:", eopf_href)
+            tree = xr.open_datatree(eopf_href, engine="zarr", chunks={})
+            for node in tree.subtree:
+                for var in node.variables.values():
+                    for key in ZARR_ENCODING_KEYS:
+                        var.encoding.pop(key, None)
+                    if var.dtype.kind in "USO":
+                        # a string _FillValue (e.g. "" on conditions/geometry/detector) is
+                        # written as an attribute that xarray cannot decode when reading
+                        var.encoding.pop("_FillValue", None)
+            tree.to_zarr(zarr_path, mode="w", zarr_format=3, consolidated=True)
+            # the HEALPix conversion opens the store with xarray: check that it can
+            xr.open_datatree(zarr_path, engine="zarr", chunks={}).close()
+
+
+        # ---- upload ---------------------------------------------------------------
+        def check_local_store(local_store):
+            with open(os.path.join(local_store, "zarr.json")) as f:
+                metadata = json.load(f)
+            if not is_complete(metadata):
+                raise RuntimeError(f"the root zarr.json of {local_store} has no stac_discovery")
+
+
+        def product_id(dest):
+            """STAC id of a mirrored store: its name without .zarr and without a .SEN3 /
+            .SAFE suffix (the product name), as stac-scraper --id-from-store-name."""
+            name = posixpath.basename(dest.rstrip("/"))
+            for suffix in (".zarr", ".SEN3", ".SAFE"):
+                if name.endswith(suffix):
+                    name = name[: -len(suffix)]
+            return name
+
+
+        def set_store_id(local_store, item_id):
+            """Give the root stac_discovery the unique id item_id; the eopf id goes to the
+            root attribute g4e_mirror.eopf_stac_id. (The ids eopf gives the tiles of one
+            S2 datatake differ only by a 3-hex-digit CRC: duplicates are likely.)"""
+            path = os.path.join(local_store, "zarr.json")
+            with open(path) as f:
+                metadata = json.load(f)
+            attributes = metadata["attributes"]
+            stac = attributes["stac_discovery"]
+            original = stac.get("id")
+            if original == item_id:
+                return
+            stac["id"] = item_id
+            marker = attributes.get("g4e_mirror")
+            marker = dict(marker) if isinstance(marker, dict) else {}
+            marker["eopf_stac_id"] = original
+            attributes["g4e_mirror"] = marker
+            with open(path, "w") as f:
+                json.dump(metadata, f, indent=2)
+            print(f"stac_discovery id: {original} -> {item_id}")
+
+
+        def upload_store(local_store, dest):
+            fs, root = get_fs(dest)
+            body, last = [], {}
+            for dirpath, _, filenames in os.walk(local_store):
+                for name in filenames:
+                    local = os.path.join(dirpath, name)
+                    rel = os.path.relpath(local, local_store).replace(os.sep, "/")
+                    if rel in ROOT_METADATA:
+                        last[rel] = local
+                    else:
+                        body.append((local, posixpath.join(root, rel)))
+            protocols = fs.protocol if isinstance(fs.protocol, (tuple, list)) else (fs.protocol,)
+            if not {"s3", "s3a"} & set(protocols):  # real directories (local tests)
+                for d in sorted({posixpath.dirname(r) for _, r in body} | {root}):
+                    fs.makedirs(d, exist_ok=True)
+            print(f"uploading {len(body) + len(last)} files to {dest}")
+            t0 = time.monotonic()
+            # an interrupted upload leaves a store without stac_discovery, which
+            # stac-scraper skips and the next attempt deletes
+            placeholder = os.path.join(WORK_DIR, "placeholder-zarr.json")
+            with open(placeholder, "w") as f:
+                json.dump(PLACEHOLDER, f)
+            fs.put_file(placeholder, posixpath.join(root, "zarr.json"))
+            os.remove(placeholder)
+            with ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
+                for _ in pool.map(lambda pair: fs.put_file(*pair), body):
+                    pass
+            for rel in ROOT_METADATA:
+                if rel in last:
+                    fs.put_file(last[rel], posixpath.join(root, rel))
+            print(f"uploaded in {time.monotonic() - t0:.0f} s")
+
+
+        def main():
+            item = json.loads(item_json)
+            dest = item["mirror_path"].rstrip("/")
+            print(f"item {item['id']}\n  -> {dest}")
+            fs, root = get_fs(dest)
+            if is_complete(root_metadata(fs, root)):
+                print("already mirrored (root zarr.json with stac_discovery), skipping")
+                return
+
+            os.makedirs(WORK_DIR, exist_ok=True)
+            stem = posixpath.basename(dest)
+            stem = stem[: -len(".zarr")] if stem.endswith(".zarr") else stem
+            local_zarr = os.path.join(WORK_DIR, f"{stem}.zarr")
+            local_safe = os.path.join(WORK_DIR, item["safe_name"])
+            try:
+                shutil.rmtree(local_zarr, ignore_errors=True)
+                built = False
+                if item.get("eopf_href"):
+                    try:
+                        copy_sample_service(item["eopf_href"], local_zarr)
+                        check_local_store(local_zarr)
+                        built = True
+                    except Exception as exc:
+                        print(f"Sample Service copy failed ({type(exc).__name__}: {redact(exc)}); "
+                              "falling back to the CDSE SAFE")
+                        shutil.rmtree(local_zarr, ignore_errors=True)
+                if not built:
+                    require_cdse_credentials()
+                    print(f"downloading {item['safe_name']} from CDSE")
+                    download(item["href"], local_safe, item.get("checksum"), int(item.get("size") or 0))
+                    convert_safe(local_safe, local_zarr)
+                    os.remove(local_safe)  # free the disk before the upload
+                    check_local_store(local_zarr)
+                set_store_id(local_zarr, product_id(dest))
+                remove_partial(fs, root)
+                upload_store(local_zarr, dest)
+                print("done:", dest)
+            finally:
+                shutil.rmtree(local_zarr, ignore_errors=True)
+                if os.path.exists(local_safe):
+                    os.remove(local_safe)
+
+
+        if __name__ == "__main__":
+            main()

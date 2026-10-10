@@ -1,0 +1,2807 @@
+# Multi-stage conversion of EOPF Zarr product(s) into ONE HEALPix Zarr dataset
+# (GRID4EARTH/legacy-datasets#8). Argo runs the stages and retries what fails:
+#
+#   stage-cache     validates the arguments (also output_extent / extent_info, see
+#                   below), refuses an existing output (unless overwrite=true), runs
+#                   create_staging_cache once, drops the groups that cannot be merged
+#                   (see below), publishes the cache (artifact 'cache') and splits
+#                   every spatial group's output chunks into tasks (parameter
+#                   'tasks', artifact 'tasks').
+#   prepare         prepare_healpix_dataset: creates the output Zarr dataset with all
+#                   groups, arrays and metadata but no resampled data yet. Its root
+#                   STAC item is stored as 'stac_discovery_pending', so stac-scraper
+#                   does not index the dataset before it is complete.
+#   convert-chunks  convert_group_to_healpix(group, chunk_indices=...) for each task,
+#                   one 1-CPU pod per task, at most `parallelism` pods at a time (the
+#                   heavy groups in sub-batches, each in a new process, see
+#                   "Conversion pods").
+#   finalize        checks that every chunk of each dense group was written,
+#                   consolidates the metadata, cleans the STAC item (see below) and
+#                   publishes it as the root 'stac_discovery'.
+#
+# Tasks: 'tasks' is a JSON list of {"group": "<group path>", "chunk_indices": "<JSON>",
+# "chunks_per_process": <int>, "lane": <int>}. chunk_indices is a JSON list whose
+# items are chunk indices or [start, stop) ranges; stage-cache writes one range per
+# task, e.g. "[[0,16]]". chunks_per_process is the size of the sub-batches that
+# convert-chunk converts each in a new process (0 = the whole task in one process,
+# see "Conversion pods"). There are at most max_tasks tasks (Argo cannot keep tens of
+# thousands of nodes in one workflow: S2C orbit 4025 in 45..49 N has 19712 chunks in
+# each of the 16 chunked Sentinel-2 L2A groups). The groups cost very different times
+# per chunk (CHUNK_COST_S in stage-cache, one thread: 6 s for the 10 m reflectances,
+# 3 s for a 10 m mask, 0.06 s for a 60 m mask), so the chunks per task are chosen per
+# group from that estimate, all tasks taking about the same time (at least
+# chunks_per_task chunks; a no_chunk group is one task): with every group, 500 tasks
+# of ~16 min each at benchmark speed (156 chunks for a 10 m reflectance task, 15581
+# for a 60 m mask) instead of 31 tasks of 636 chunks per group (64 min for a 10 m
+# reflectance task, 38 s for a 60 m mask).
+#
+# Output extent: output_extent (empty = union of the input footprints) is a compact
+# GeoJSON Polygon in WGS84 lon/lat, e.g. the latitude band of a region over the full
+# swath width snapped to HEALPix parent cells (orbit-to-healpix-pipeline). Only the
+# output chunks (chunk-level HEALPix cells: level 11 for Sentinel-2) intersecting it
+# are created; stage-cache refuses anything but one valid Polygon (exit 2) and fills
+# its holes. extent_info (JSON object, default {}) describes how it was made:
+# stage-cache checks that its align_level (level of the parent cells) is not finer
+# than the chunk level of any converted group (each parent cell is then a whole
+# number of output chunks) and, when it has n_cells, warns when a dense group does
+# not get n_cells * 4**(chunk level - align_level) chunks (output_extent then does
+# not follow the cells exactly); finalize stores it in the root attributes as
+# 'orbit_extent' (not in the STAC item).
+#
+# STAC item: finalize cleans the item before publishing it as the root
+# stac_discovery that stac-scraper indexes: no proj:* properties; no assets
+# (stac-scraper adds its own from its asset templates); no self/root/parent/
+# collection links; derived_from links and processing:lineage keep public URLs only
+# (s3://grid4earth/public/<key> -> https://data.grid4earth.eu/<key>, local and other
+# s3:// paths are dropped); processing:expression (the conversion settings, an
+# object) is moved to the root attribute 'healpix_convert_settings' (the other items
+# of the catalogue use the string "systematic", rustac's geoparquet writer fails on
+# mixed types, and the processing v1.2.0 schema requires an object: an absent field
+# fits both); geometry = union of the chunk-level HEALPix cells holding data (stored
+# chunks of one data array per dense group; falls back to output_extent, then to
+# the geometry written by prepare) and bbox computed from it. The id and the
+# properties set by prepare are kept. prepare: healpix-convert keeps the properties
+# of the FIRST input (one tile), so prepare sets the time range of all inputs and
+# created = processing time, and drops the properties whose value differs between
+# the inputs (tile-specific, e.g. eopf:datastrip_id), except eo:cloud_cover /
+# eo:snow_cover, which become the mean over the inputs.
+#
+# Network: every S3 client (explicit storage options and the fsspec configuration
+# used to read the inputs, also in the dask worker processes through FSSPEC_S3) uses
+# connect / read timeouts of 120 / 600 s and up to 10 adaptive retries.
+#
+# Groups that cannot be merged: healpix-convert concatenates the inputs of a group,
+# which fails when a non-spatial dimension has different sizes in different inputs
+# (Sentinel-2 conditions/geometry: 'detector' is 6 in a full tile and 1 in a tile at
+# the edge of the swath). stage-cache leaves such groups out with a WARNING and
+# passes the remaining groups to prepare (output parameter 'groups').
+#
+# Workarounds for healpix-convert 3aa72e0 (and the converter bundled in
+# legacy_converters de458eb), to remove once fixed upstream:
+#   - half-pixel shift (FIX_HALF_PIXEL, in every stage that imports the converter):
+#     for EOPF variables without proj:* attributes (eopf 3.0 SAFE->Zarr output)
+#     core.utils.extract_spatial_info_stac returns the pixel-CENTER transform of the
+#     x/y coordinates (rasterix center_transform), which create_raster_index uses as
+#     a pixel-CORNER transform (RasterIndex.from_transform): the output would be
+#     shifted half a source pixel east and south (5/10/30 m at 10/20/60 m). The
+#     wrapped function returns the corner transform (RasterIndex.transform()) and
+#     is a no-op when the library already does. stage-cache is where it matters:
+#     the transform is serialized into the cache used by the other stages;
+#   - prepare merges list-valued STAC fields (stac_extensions) of the inputs as a
+#     union instead of failing on stores written by different eopf versions;
+#   - convert-chunk treats a chunk with 0 input points (a buffered chunk polygon
+#     grazing a tile), and for the "nearest" resampler of dense groups a chunk whose
+#     input points all lie in its buffer zone (outside the chunk cell, e.g. along the
+#     outer edge of the tiles), as a chunk without input instead of failing in the
+#     resampler ("No HEALPix cell passed the threshold"); any other occurrence of
+#     that error exits with code 2 (deterministic, not retried);
+#   - convert-chunk gives the resamplers float64 longitudes / latitudes (the no_chunk
+#     groups, e.g. Sentinel-2 conditions/meteorology, store them as float32, which
+#     makes the resampler fail).
+#
+# Parallelism: Argo does not template `parallelism` (an integer field). The tasks
+# are therefore dealt into `parallelism` lanes; each lane is a steps template with
+# parallelism 1 that runs its tasks one after another. stage-cache balances the
+# lanes on the estimated task times (longest first, each to the least loaded lane:
+# the "lane" field; lane-tasks deals round-robin when it is missing). Simulated for
+# orbit 4025, every group, 48 lanes: longest lane 1.07x the mean (1.17x on average,
+# 1.37x at worst when every group's real cost is off by up to 2x either way),
+# against 1.49x for the former round-robin of equal batches, whose 31-task group
+# blocks fall unevenly on 48 lanes (64 lanes: 1.04x / 1.18x / 1.38x against 1.31x).
+# These are estimated times, with every chunk counted as full. The chunks without
+# data (east / west swath edges, ~21 % of the extent) cost almost nothing and gather
+# in some tasks (a task is a range of consecutive chunks), so with the real work the
+# longest lane is ~1.2x the mean (simulated with the 31 footprints).
+#
+# Conversion pods: 1 CPU (request = limit), 4 Gi requested, 8 Gi limit, one thread
+# (OMP / MKL / OPENBLAS / NUMEXPR / RAYON_NUM_THREADS = 1 and torch.set_num_threads(1)),
+# nworkers 1 (no dask cluster), parallelism 48. Threads help less than more pods: on
+# T31UDQ one chunk of all 16 chunked groups takes 13.3 s with 4 threads and ~22 s with
+# 1 (10 m reflectances 4.85 s / 6.0 s), so four 1-CPU pods convert more than twice as
+# much as one 4-CPU pod. Without the thread limits torch / OpenMP / rayon start one
+# thread per node core (16) inside a 1-CPU quota and are throttled.
+#
+# Memory: converting a chunk needs at most ~1.7 GiB (10 m nearest groups; 1.1 GiB
+# for the 10 m reflectances, < 0.9 GiB for the other groups: peak physical footprint
+# measured on macOS) and nothing accumulates from chunk to chunk (Python objects,
+# tracemalloc and the bytes in use of malloc stay flat). The allocators however keep
+# the memory freed after each chunk: in ONE process, a 472-chunk task of a 10 m mask
+# reached 8.2 GiB resident (macOS: ~0.3 GiB in use between chunks, <= 1.7 GiB within
+# one, the rest freed memory kept by libmalloc), more than the 8 Gi limit; how much
+# glibc keeps on the nodes was not measured. convert-chunk therefore converts the
+# tasks of the 10 m and 20 m groups in even sub-batches of at most chunks_per_process
+# chunks (CHUNKS_PER_PROCESS in stage-cache, ~5 minutes of work: 50 chunks of a 10 m
+# reflectance, 100 of a 10 m mask, 400 of a 20 m mask), each in a new Python process
+# that gives all its memory back when it ends; the 60 m and no_chunk groups keep one
+# process per task (flat: < 1 GiB resident after 300-1000 chunks). The same 472
+# chunks in 5 processes: peak RSS 6.8 GiB (macOS, still mostly freed memory kept by
+# libmalloc) instead of 8.2 GiB. The start-up of a process (~7 s locally: imports,
+# cache, inputs, first chunks in fresh memory) costs 2-3 % of its work. Each
+# convert-chunk log ends with the peak RSS of its processes, the number to check on
+# the cluster: lower CHUNKS_PER_PROCESS if it comes close to 8 GiB.
+#
+# Scale: for orbit 4025, 45..49 N, every group (15609 of the 19712 chunks per group
+# hold data, 503 of them cross the edge of the data): ~155-160 CPU-hours on the
+# cluster (benchmark x1.5, ~6 of them for the start-up of ~1900 processes;
+# stage-cache prints 198 as an upper bound, every chunk counted as full), a mean
+# lane of ~4.9 h with 32 pods, ~3.3 h with 48 (4 b3-64 nodes of 16 vCPU / 64 GB: 14
+# pods per node by memory requests) and ~2.5 h with 64 (5 nodes); the conversion
+# takes as long as the longest lane, ~1.2x that (see above): ~6 h with 32 pods,
+# ~3.9 h with 48, ~3.1 h with 64, against ~11 h with the former 8 pods of 4 CPU /
+# 16 Gi. nworkers > 1 needs more CPUs in the convert-chunk resources (otherwise the
+# workers share one CPU).
+#
+# Overwrite and retries: prepare opens the output in mode "w", which deletes
+# whatever is there, so the existing-output check is done once, in stage-cache,
+# before anything is written. prepare runs only after that check, and the chunk
+# tasks only after prepare succeeded, so a retry of prepare (retryStrategy or an
+# Argo retry of a failed run) can only wipe its own partial output, never data
+# written by chunk tasks. With overwrite=true the existing (published) dataset is
+# deleted by prepare and only re-published by finalize. Exit code 3 of stage-cache
+# (output exists) and exit code 2 (invalid arguments, incomplete output) are not
+# retried. To resume after failed chunk tasks, retry the workflow (Argo retry, e.g.
+# retry_workflow of the Python client, see tf/README.md: only the failed tasks run
+# again); submitting a new workflow on the same output_path fails
+# in stage-cache unless overwrite=true, which starts from scratch.
+#
+# Artifacts: 'cache' and 'tasks' are stored at an explicit S3 location
+# (s3://g4e-desp-argo-artifacts/healpix-convert-multistage/<workflow uid>/), so the
+# template does not depend on the default artifact repository of the controller.
+#
+# The DAG template 'main' takes every argument as an input parameter (only
+# input_paths and output_path have no default) and exposes output_path and
+# stac_item_id, so another WorkflowTemplate can call it with
+# templateRef {name: healpix-convert-multistage, template: main}. Volumes are
+# declared per template; the calling workflow must use serviceAccountName
+# argo-workflow and imagePullSecrets harbor-pull-secret.
+#
+# Secret: argo-s3-credentials (accessKey, secretKey), mounted at /etc/s3.
+# healpix_convert opens the inputs with xr.open_datatree(path) and no storage
+# options, so every pod sets fsspec.config.conf["s3"] (honoured by every
+# S3FileSystem) and AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_ENDPOINT_URL
+# (inherited by the dask worker processes) before opening anything. Objects
+# written under s3://grid4earth/public/ get the public-read ACL.
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: healpix-convert-multistage
+  namespace: argo
+spec:
+  entrypoint: main
+  serviceAccountName: argo-workflow
+  imagePullSecrets:
+    - name: harbor-pull-secret
+  arguments:
+    parameters:
+      - name: input_paths
+        value: "[]"
+        description: JSON list of input EOPF Zarr paths (s3://..., https://... or local)
+      - name: output_path
+        value: ""
+        description: output HEALPix Zarr path, e.g. s3://grid4earth/public/converted/sentinel-2-l2a/S2C_MSIL2A_20250613T104641_R051_O4025_N45-N49.zarr
+      - name: settings_name
+        value: sentinel-2-l2a
+        description: legacy_converters get_settings() name, or an inline JSON ConvertSettings document
+      - name: groups
+        value: ""
+        description: empty = all groups, else a JSON list of input group paths (or a JSON string glob pattern)
+      - name: output_extent
+        value: ""
+        description: empty = union of the input footprints, else a compact GeoJSON Polygon (WGS84 lon/lat) limiting the output chunks
+      - name: extent_info
+        value: "{}"
+        description: JSON object describing output_extent (e.g. latitude band, align_level, rule), stored in the root attributes as orbit_extent; align_level must be <= the chunk level of every converted group
+      - name: chunks_per_task
+        value: "16"
+        description: minimum number of chunks converted by one pod (raised per group from its estimated cost so that tasks take about the same time and stay within max_tasks)
+      - name: max_tasks
+        value: "500"
+        description: upper bound on the number of chunk tasks (pods) in the workflow
+      - name: parallelism
+        value: "48"
+        description: number of chunk tasks (1-CPU pods, 4-8 Gi) running at the same time, i.e. lanes
+      - name: overwrite
+        value: "false"
+        enum: ["true", "false"]
+        description: replace an existing output dataset
+      - name: nworkers
+        value: "1"
+        description: dask workers per chunk pod (1 = no dask cluster); the pods have 1 CPU, keep 1
+      - name: s3_endpoint
+        value: https://s3.gra.io.cloud.ovh.net
+      - name: healpix_image
+        value: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-01
+  templates:
+  - name: main
+    inputs:
+      parameters:
+        - name: input_paths
+        - name: output_path
+        - name: settings_name
+          default: sentinel-2-l2a
+        - name: groups
+          default: ""
+        - name: output_extent
+          default: ""
+        - name: extent_info
+          default: "{}"
+        - name: chunks_per_task
+          default: "16"
+        - name: max_tasks
+          default: "500"
+        - name: parallelism
+          default: "48"
+        - name: overwrite
+          default: "false"
+        - name: nworkers
+          default: "1"
+        - name: s3_endpoint
+          default: https://s3.gra.io.cloud.ovh.net
+        - name: healpix_image
+          default: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-01
+    outputs:
+      parameters:
+        - name: output_path
+          valueFrom:
+            parameter: "{{tasks.finalize.outputs.parameters.output_path}}"
+        - name: stac_item_id
+          valueFrom:
+            parameter: "{{tasks.finalize.outputs.parameters.stac_item_id}}"
+    dag:
+      tasks:
+        - name: stage-cache
+          template: stage-cache
+          arguments:
+            parameters:
+              - name: input_paths
+                value: "{{inputs.parameters.input_paths}}"
+              - name: output_path
+                value: "{{inputs.parameters.output_path}}"
+              - name: settings_name
+                value: "{{inputs.parameters.settings_name}}"
+              - name: groups
+                value: "{{inputs.parameters.groups}}"
+              - name: output_extent
+                value: "{{inputs.parameters.output_extent}}"
+              - name: extent_info
+                value: "{{inputs.parameters.extent_info}}"
+              - name: chunks_per_task
+                value: "{{inputs.parameters.chunks_per_task}}"
+              - name: max_tasks
+                value: "{{inputs.parameters.max_tasks}}"
+              - name: parallelism
+                value: "{{inputs.parameters.parallelism}}"
+              - name: overwrite
+                value: "{{inputs.parameters.overwrite}}"
+              - name: nworkers
+                value: "{{inputs.parameters.nworkers}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+        - name: prepare
+          depends: stage-cache
+          template: prepare
+          arguments:
+            parameters:
+              - name: output_path
+                value: "{{inputs.parameters.output_path}}"
+              - name: settings_name
+                value: "{{inputs.parameters.settings_name}}"
+              # the groups kept by stage-cache (same selection as the cache)
+              - name: groups
+                value: "{{tasks.stage-cache.outputs.parameters.groups}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+            artifacts:
+              - name: cache
+                from: "{{tasks.stage-cache.outputs.artifacts.cache}}"
+        - name: convert-chunks
+          depends: prepare
+          template: convert-lane
+          withParam: "{{tasks.stage-cache.outputs.parameters.lanes}}"
+          arguments:
+            parameters:
+              - name: lane
+                value: "{{item}}"
+              - name: n_lanes
+                value: "{{tasks.stage-cache.outputs.parameters.n_lanes}}"
+              - name: output_path
+                value: "{{inputs.parameters.output_path}}"
+              - name: settings_name
+                value: "{{inputs.parameters.settings_name}}"
+              - name: nworkers
+                value: "{{inputs.parameters.nworkers}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+            artifacts:
+              - name: cache
+                from: "{{tasks.stage-cache.outputs.artifacts.cache}}"
+              - name: tasks
+                from: "{{tasks.stage-cache.outputs.artifacts.tasks}}"
+        - name: finalize
+          depends: convert-chunks
+          template: finalize
+          arguments:
+            parameters:
+              - name: output_path
+                value: "{{inputs.parameters.output_path}}"
+              - name: settings_name
+                value: "{{inputs.parameters.settings_name}}"
+              - name: output_extent
+                value: "{{inputs.parameters.output_extent}}"
+              - name: extent_info
+                value: "{{inputs.parameters.extent_info}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+            artifacts:
+              - name: cache
+                from: "{{tasks.stage-cache.outputs.artifacts.cache}}"
+
+  # One lane: its share of the tasks, one pod after the other. failFast false keeps
+  # the lane going after a task failed for good (the lane, hence the run, still
+  # ends Failed and an Argo retry of the workflow re-runs only the failed tasks).
+  - name: convert-lane
+    parallelism: 1
+    failFast: false
+    inputs:
+      parameters:
+        - name: lane
+        - name: n_lanes
+        - name: output_path
+        - name: settings_name
+        - name: nworkers
+        - name: s3_endpoint
+        - name: healpix_image
+      artifacts:
+        - name: cache
+        - name: tasks
+    steps:
+      - - name: lane-tasks
+          template: lane-tasks
+          arguments:
+            parameters:
+              - name: lane
+                value: "{{inputs.parameters.lane}}"
+              - name: n_lanes
+                value: "{{inputs.parameters.n_lanes}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+            artifacts:
+              - name: tasks
+                from: "{{inputs.artifacts.tasks}}"
+      - - name: convert-chunk
+          template: convert-chunk
+          withParam: "{{steps.lane-tasks.outputs.parameters.tasks}}"
+          arguments:
+            parameters:
+              - name: group
+                value: "{{item.group}}"
+              - name: chunk_indices
+                value: "{{item.chunk_indices}}"
+              - name: chunks_per_process
+                value: "{{item.chunks_per_process}}"
+              - name: output_path
+                value: "{{inputs.parameters.output_path}}"
+              - name: settings_name
+                value: "{{inputs.parameters.settings_name}}"
+              - name: nworkers
+                value: "{{inputs.parameters.nworkers}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+            artifacts:
+              - name: cache
+                from: "{{inputs.artifacts.cache}}"
+
+  - name: stage-cache
+    retryStrategy:
+      limit: "2"
+      retryPolicy: Always
+      # exit code 3 = the output already exists, 2 = invalid arguments: retrying cannot help
+      expression: 'lastRetry.exitCode != "3" && lastRetry.exitCode != "2"'
+      backoff:
+        duration: "30s"
+        factor: "2"
+    # per attempt; also bounds a pod stuck in Pending (ImagePullBackOff)
+    activeDeadlineSeconds: 7200
+    inputs:
+      parameters:
+        - name: input_paths
+        - name: output_path
+        - name: settings_name
+        - name: groups
+        - name: output_extent
+        - name: extent_info
+        - name: chunks_per_task
+        - name: max_tasks
+        - name: parallelism
+        - name: overwrite
+        - name: nworkers
+        - name: s3_endpoint
+        - name: healpix_image
+    outputs:
+      parameters:
+        - name: tasks
+          valueFrom:
+            path: /tmp/out/tasks.json
+        - name: lanes
+          valueFrom:
+            path: /tmp/out/lanes.json
+        - name: n_lanes
+          valueFrom:
+            path: /tmp/out/n_lanes
+        - name: n_tasks
+          valueFrom:
+            path: /tmp/out/n_tasks
+        - name: n_chunks
+          valueFrom:
+            path: /tmp/out/n_chunks
+        - name: groups
+          valueFrom:
+            path: /tmp/out/groups
+      artifacts:
+        # explicit location: the default artifact repository is not relied upon
+        - name: cache
+          path: /tmp/out/cache.json
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.gra.io.cloud.ovh.net
+            region: gra
+            insecure: false
+            bucket: g4e-desp-argo-artifacts
+            key: "healpix-convert-multistage/{{workflow.uid}}/cache.json"
+            accessKeySecret:
+              name: argo-s3-credentials
+              key: accessKey
+            secretKeySecret:
+              name: argo-s3-credentials
+              key: secretKey
+        - name: tasks
+          path: /tmp/out/tasks.json
+          archive:
+            none: {}
+          s3:
+            endpoint: s3.gra.io.cloud.ovh.net
+            region: gra
+            insecure: false
+            bucket: g4e-desp-argo-artifacts
+            key: "healpix-convert-multistage/{{workflow.uid}}/tasks.json"
+            accessKeySecret:
+              name: argo-s3-credentials
+              key: accessKey
+            secretKeySecret:
+              name: argo-s3-credentials
+              key: secretKey
+    volumes:
+      - name: s3-creds
+        secret:
+          secretName: argo-s3-credentials
+    script:
+      image: "{{inputs.parameters.healpix_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      # One pod, before any conversion pod. Measured locally with every Sentinel-2 L2A
+      # group: cache.json 63 KB for one input, +~52 KB per input (the per-group
+      # transforms), so ~1.6 MB for the 31 inputs of orbit 4025 in 45..49 N; peak RSS
+      # 0.35 GiB for create_staging_cache, +~2 MiB per opened input (lazy): ~0.5 GiB
+      # expected for 31 inputs. 8 Gi is kept as headroom (S3 / fsspec buffers, the
+      # second create_staging_cache when groups are dropped); 2 CPUs for the S3 opens.
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+        limits:
+          cpu: "2"
+          memory: 8Gi
+      volumeMounts:
+        - name: s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+      source: |
+        # Argo parameters (substituted by Argo before the script runs)
+        input_paths = r'''{{inputs.parameters.input_paths}}'''
+        output_path = "{{inputs.parameters.output_path}}"
+        settings_name = r'''{{inputs.parameters.settings_name}}'''
+        groups = r'''{{inputs.parameters.groups}}'''
+        output_extent = r'''{{inputs.parameters.output_extent}}'''
+        extent_info = r'''{{inputs.parameters.extent_info}}'''
+        chunks_per_task = "{{inputs.parameters.chunks_per_task}}"
+        max_tasks = "{{inputs.parameters.max_tasks}}"
+        parallelism = "{{inputs.parameters.parallelism}}"
+        overwrite = "{{inputs.parameters.overwrite}}"
+        nworkers = "{{inputs.parameters.nworkers}}"
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        import importlib
+        import json
+        import math
+        import os
+        import sys
+        import types
+
+        S3_CREDS_DIR = "/etc/s3"
+        OUT_DIR = "/tmp/out"
+        PUBLIC_READ_PREFIXES = ("s3://grid4earth/public/",)
+        # slow or flaky links: long timeouts and adaptive retries for every S3 client
+        S3_CONFIG_KWARGS = {
+            "connect_timeout": 120,
+            "read_timeout": 600,
+            "retries": {"max_attempts": 10, "mode": "adaptive"},
+        }
+        FIX_HALF_PIXEL = True  # see fix_half_pixel()
+        EXIT_INVALID = 2
+        EXIT_OUTPUT_EXISTS = 3
+        # Estimated conversion time (s, one CPU, one thread) of ONE output chunk holding
+        # data, per (resampler, output level - chunk level). Measured one process at a
+        # time on the Sentinel-2 L2A tile T31UDQ, local store (healpix-convert 3aa72e0,
+        # 2026-10-10): psf 6.0 / 3.8 / 0.58 s for the 10 / 20 / 60 m reflectances,
+        # nearest 2.6 / 0.64 / 0.06 s for the 10 / 20 / 60 m masks. A nearest chunk that
+        # crosses the edge of the data (the east / west edges of the swath, ~3 % of the
+        # chunks with data in orbit 4025) costs more, ~20 s at 10 m and ~1.7 s at 20 m
+        # (the resampler searches a point for every output cell left without one), hence
+        # 3.0 and 0.7. Other combinations: CHUNK_COST_FALLBACK * 2**d (x4 for psf), close
+        # to the table for psf. They size the tasks, balance the lanes and give the
+        # printed estimate.
+        CHUNK_COST_S = {
+            ("psf", 9): 6.0, ("psf", 8): 3.8, ("psf", 6): 0.6,
+            ("nearest", 9): 3.0, ("nearest", 8): 0.7, ("nearest", 6): 0.06,
+        }
+        # Chunks converted per process by convert-chunk, per (resampler, output level -
+        # chunk level): a task of these groups is converted in sub-batches of that many
+        # chunks, each in a new Python process (see "Conversion pods" in the header),
+        # about 5 minutes of work each, so that the start-up of a process (~7 s measured:
+        # imports, cache, inputs, first chunks in fresh memory) costs 2-3 %. Other
+        # groups (60 m, no_chunk) convert a whole task in one process: their memory
+        # stays flat.
+        CHUNKS_PER_PROCESS = {("psf", 9): 50, ("psf", 8): 80, ("nearest", 9): 100, ("nearest", 8): 400}
+        PROCESS_START_S = 10  # start-up of each further process of a task, in the estimates
+        CHUNK_COST_FALLBACK = 3e-3
+        CLUSTER_SLOWDOWN = 1.5  # assumed cluster core / benchmark core, for the printed estimate
+        CONVERT_DEADLINE_S = 14400  # activeDeadlineSeconds of convert-chunk
+
+
+        def fail(message, code=EXIT_INVALID):
+            print(f"ERROR: {message}", flush=True)
+            sys.exit(code)
+
+
+        def read_s3_credentials():
+            """(key, secret) from the mounted secret, or None when it is not mounted."""
+            key_file = os.path.join(S3_CREDS_DIR, "accessKey")
+            secret_file = os.path.join(S3_CREDS_DIR, "secretKey")
+            if not (os.path.isfile(key_file) and os.path.isfile(secret_file)):
+                return None
+            with open(key_file) as f:
+                key = f.read().strip()
+            with open(secret_file) as f:
+                secret = f.read().strip()
+            return key, secret
+
+
+        def configure_s3(endpoint):
+            """Let s3:// paths opened without storage options use the cluster credentials.
+
+            Returns the storage options for explicit S3 access, or None without credentials.
+            """
+            creds = read_s3_credentials()
+            if creds is None:
+                print(f"no S3 credentials in {S3_CREDS_DIR}: s3:// paths are not accessible")
+                return None
+            key, secret = creds
+            os.environ["AWS_ACCESS_KEY_ID"] = key
+            os.environ["AWS_SECRET_ACCESS_KEY"] = secret
+            if endpoint:
+                os.environ["AWS_ENDPOINT_URL"] = endpoint
+            import fsspec.config
+
+            options = {"key": key, "secret": secret, "config_kwargs": S3_CONFIG_KWARGS}
+            if endpoint:
+                options["client_kwargs"] = {"endpoint_url": endpoint}
+            fsspec.config.conf["s3"] = json.loads(json.dumps(options))
+            # the same settings in the processes started from here (dask workers): fsspec
+            # reads FSSPEC_S3 when imported, the credentials come from the AWS_* variables
+            os.environ["FSSPEC_S3"] = json.dumps(
+                {k: v for k, v in options.items() if k not in ("key", "secret")}
+            )
+            return options
+
+
+        def storage_options_for(url, s3_options):
+            if not url.startswith("s3://"):
+                return None
+            if s3_options is None:
+                fail(f"{url} needs S3 credentials in {S3_CREDS_DIR}", 1)
+            options = json.loads(json.dumps(s3_options))
+            if url.startswith(PUBLIC_READ_PREFIXES):
+                options["s3_additional_kwargs"] = {"ACL": "public-read"}
+            return options
+
+
+        _half_pixel = {"corrected": 0}
+
+
+        def same_transform(a, b):
+            """Equal affine transforms (6 coefficients, relative tolerance 1e-9)."""
+            return all(
+                abs(p - q) <= 1e-9 * max(1.0, abs(p), abs(q)) for p, q in zip(tuple(a)[:6], tuple(b)[:6])
+            )
+
+
+        def fix_half_pixel():
+            """Make extract_spatial_info_stac return the pixel-corner transform it is used as.
+
+            For EOPF variables without proj:* attributes it returns rasterix center_transform()
+            of the x/y coordinates, but create_raster_index passes it to
+            RasterIndex.from_transform(), which expects the corner transform: the output is
+            then shifted half a source pixel east and south. Wraps the module attribute (the
+            converter calls utils.extract_spatial_info_stac); no-op for a transform that
+            already is the corner one (fixed upstream) or comes from proj:transform.
+            """
+            if not FIX_HALF_PIXEL:
+                print("half-pixel correction disabled (FIX_HALF_PIXEL = False)")
+                return
+            for name in ("healpix_convert.core.utils", "legacy_converters.core.utils"):
+                try:
+                    module = importlib.import_module(name)
+                except ImportError:
+                    continue
+                original = getattr(module, "extract_spatial_info_stac", None)
+                if original is None or getattr(original, "g4e_patched", False):
+                    continue
+
+                def extract(ds, *args, _original=original, _module=module, **kwargs):
+                    info = _original(ds, *args, **kwargs)
+                    transforms = (info or {}).get("transform")
+                    if not transforms or len(transforms) != 1 or not ds.data_vars:
+                        return info
+                    attrs = next(iter(ds.data_vars.values())).attrs
+                    get_crs = getattr(_module, "_get_stac_proj_crs", None)
+                    if get_crs is not None:
+                        has_proj = get_crs(attrs) is not None
+                    else:
+                        has_proj = any(str(key).startswith("proj:") for key in attrs)
+                    if has_proj or "x" not in ds.variables or "y" not in ds.variables:
+                        return info  # proj:transform: already the corner transform
+                    import rasterix
+
+                    index = rasterix.assign_index(ds, x_dim="x", y_dim="y", crs=False).xindexes["x"]
+                    corner, center = index.transform(), index.center_transform()
+                    current = transforms[0]
+                    if same_transform(current, corner):
+                        return info  # fixed upstream
+                    if not same_transform(current, center):
+                        print(f"WARNING: unexpected transform {tuple(current)[:6]} (corner "
+                              f"{tuple(corner)[:6]}), half-pixel correction not applied", flush=True)
+                        return info
+                    _half_pixel["corrected"] += 1
+                    if _half_pixel["corrected"] == 1:
+                        print(f"half-pixel correction ({_module.__name__}.extract_spatial_info_stac, "
+                              f"logged once): pixel-center origin ({current.c}, {current.f}) -> "
+                              f"pixel-corner origin ({corner.c}, {corner.f}), pixel size "
+                              f"{corner.a} x {corner.e}", flush=True)
+                    return dict(info, transform=[corner])
+
+                extract.g4e_patched = True
+                module.extract_spatial_info_stac = extract
+
+
+        def import_api():
+            try:
+                from healpix_convert import ConvertSettings, create_staging_cache
+                from healpix_convert.healpix_converters import init_converter
+                from legacy_converters import get_settings
+                import healpix_convert as package
+            except ImportError:
+                # image with the old legacy_converters that bundles the converter
+                from legacy_converters import ConvertSettings, create_staging_cache, get_settings
+                from legacy_converters.healpix_converters import init_converter
+                import legacy_converters as package
+            print(f"converter: {package.__name__} {getattr(package, '__version__', '?')}")
+            return types.SimpleNamespace(
+                ConvertSettings=ConvertSettings,
+                create_staging_cache=create_staging_cache,
+                get_settings=get_settings,
+                init_converter=init_converter,
+            )
+
+
+        def resolve_settings(api, name):
+            text = name.strip()
+            try:
+                if text.startswith("{"):
+                    settings = api.ConvertSettings.model_validate_json(text)
+                else:
+                    settings = api.get_settings(text)
+            except Exception as exc:
+                fail(f"invalid settings_name {text[:80]!r}: {type(exc).__name__}: {exc}")
+            if not isinstance(settings, api.ConvertSettings):
+                settings = api.ConvertSettings.model_validate(settings.model_dump())
+            return settings
+
+
+        def parse_groups(text):
+            """None (all groups), a glob pattern, or a list of absolute group paths."""
+            text = text.strip()
+            if not text:
+                return None
+            try:
+                value = json.loads(text)
+            except ValueError:
+                value = None
+            if isinstance(value, str):
+                return value
+            if not value or not isinstance(value, list) or not all(isinstance(g, str) for g in value):
+                fail(f"groups must be empty, a JSON list of group paths or a JSON string: {text}")
+            return ["/" + g.strip("/") for g in value]
+
+
+        def parse_positive_int(name, text):
+            try:
+                value = int(text)
+            except ValueError:
+                value = 0
+            if value < 1:
+                fail(f"{name} must be a positive integer, got {text!r}")
+            return value
+
+
+        def parse_bool(name, text):
+            value = text.strip().lower()
+            if value not in ("true", "false"):
+                fail(f"{name} must be 'true' or 'false', got {text!r}")
+            return value == "true"
+
+
+        def parse_output_extent(text):
+            """None (union of the input footprints) or a valid shapely Polygon (WGS84 lon/lat)."""
+            text = text.strip()
+            if not text:
+                return None
+            import shapely
+            import shapely.geometry
+
+            try:
+                value = json.loads(text)
+            except ValueError as exc:
+                fail(f"output_extent is not JSON ({exc}): {text[:80]!r}")
+            if not isinstance(value, dict) or value.get("type") != "Polygon":
+                kind = value.get("type") if isinstance(value, dict) else type(value).__name__
+                fail(f"output_extent must be a GeoJSON Polygon, got {kind!r}")
+            try:
+                polygon = shapely.geometry.shape(value)
+            except Exception as exc:
+                fail(f"invalid output_extent polygon: {type(exc).__name__}: {exc}")
+            if not isinstance(polygon, shapely.Polygon) or polygon.is_empty:
+                fail("output_extent is an empty polygon")
+            if not polygon.is_valid:
+                fail(f"output_extent is not a valid polygon: {shapely.is_valid_reason(polygon)}")
+            west, south, east, north = polygon.bounds
+            if west < -180 or east > 180 or south < -90 or north > 90:
+                fail(f"output_extent is not in lon/lat degrees: bounds {polygon.bounds}")
+            if polygon.interiors:
+                # the converter gives polygon_coverage every vertex of the polygon
+                # (shapely.get_coordinates) as one ring; a hole (a gap in the swath)
+                # holds no input data anyway, its chunks just stay empty
+                print(f"WARNING: the {len(polygon.interiors)} hole(s) of output_extent are filled")
+                polygon = shapely.Polygon(polygon.exterior)
+            return polygon
+
+
+        def parse_extent_info(text):
+            """extent_info as a dict; its align_level, if any, must be a HEALPix level."""
+            try:
+                value = json.loads(text.strip() or "{}")
+            except ValueError:
+                value = None
+            if not isinstance(value, dict):
+                fail(f"extent_info must be a JSON object, got {text[:80]!r}")
+            level = value.get("align_level")
+            if level is not None and (isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 29):
+                fail(f"extent_info align_level must be an integer HEALPix level (0-29), got {level!r}")
+            return value
+
+
+        def check_align_level(settings, cache, align_level):
+            """output_extent is snapped to HEALPix cells of level align_level: each of them must be
+            a whole number of output chunks, i.e. align_level <= the chunk level of every chunked
+            group (no_chunk groups are converted in one piece)."""
+            if align_level is None:
+                return
+            levels = set()
+            for group_path in cache.input_spatial_groups:
+                chunk = settings.group_settings[group_path].chunk
+                level = getattr(getattr(chunk, "healpix", None), "refinement_level", None)
+                if level is None:
+                    continue
+                if align_level > level:
+                    fail(f"extent_info align_level {align_level} is finer than the chunk level {level} "
+                         f"of group /{group_path}: it must be <= {level}")
+                levels.add(level)
+            print(f"align_level {align_level} <= chunk level(s) {sorted(levels)} of the chunked groups")
+
+
+        def check_extent_chunks(settings, chunk_counts, details):
+            """When output_extent traces n_cells HEALPix cells of align_level (extent_info of
+            band mode), every healpix_cell_dense group must have n_cells * 4**(chunk level -
+            align_level) chunks; otherwise chunks along the cell edges are added or lost (the
+            query checks this at level 11 when that is cheap; here at each group's level)."""
+            level, n_cells = details.get("align_level"), details.get("n_cells")
+            if not isinstance(level, int) or isinstance(n_cells, bool) or not isinstance(n_cells, int):
+                return
+            found = {}  # (chunk level, chunks) -> groups
+            for group_path, n_chunks in chunk_counts.items():
+                chunk = settings.group_settings[group_path].chunk
+                chunk_level = getattr(getattr(chunk, "healpix", None), "refinement_level", None)
+                if chunk.method == "healpix_cell_dense" and isinstance(chunk_level, int):
+                    found.setdefault((chunk_level, n_chunks), []).append(str(group_path))
+            for (chunk_level, n_chunks), names in sorted(found.items()):
+                expected = n_cells * 4 ** (chunk_level - level)
+                if n_chunks != expected:
+                    print(f"WARNING: {len(names)} group(s) of chunk level {chunk_level} (/{names[0]}, ...) "
+                          f"have {n_chunks} chunks in output_extent, expected {expected} for its {n_cells} "
+                          f"level-{level} cells: chunks along the cell edges are added or lost")
+            if found:
+                print(f"output_extent: chunk counts checked against {n_cells} level-{level} cells at "
+                      f"chunk level(s) {sorted({k[0] for k in found})}")
+
+
+        def report_extent(cache, extent):
+            import shapely
+
+            if extent is None:
+                return
+            footprints = [g for g in getattr(cache.input_spatial, "geometry_latlon", []) if not g.is_empty]
+            if footprints and not extent.intersects(shapely.union_all(footprints)):
+                print("WARNING: output_extent does not intersect the footprint of any input")
+
+
+        def report_transforms(cache):
+            """Pixel-corner origin and size of the projected groups, as the converter uses them."""
+            if FIX_HALF_PIXEL:
+                print(f"half-pixel correction applied to {_half_pixel['corrected']} group transform(s)")
+            for group_path, info in cache.input_spatial_groups.items():
+                transforms = getattr(info, "transform", None)
+                if transforms:
+                    t = transforms[0]
+                    more = f" (first of {len(transforms)} inputs)" if len(transforms) > 1 else ""
+                    print(f"  - /{group_path}: transform origin x0={t.c} y0={t.f}, pixel {t.a} x {t.e}{more}")
+
+
+        def output_exists(url, storage_options):
+            import fsspec.core
+
+            fs, path = fsspec.core.url_to_fs(url, **(storage_options or {}))
+            return fs.exists(path)
+
+
+        def unmergeable_groups(cache):
+            """{group: {dim: sizes}} for the spatial groups with a non-spatial dimension
+            whose size differs between the inputs (healpix-convert concatenates them)."""
+            trees = list(cache.input_datatrees.values())
+            problems = {}
+            if len(trees) < 2:
+                return problems
+            for group_path, info in cache.input_spatial_groups.items():
+                spatial = getattr(info, "spatial_dimensions", None)
+                if spatial is None:
+                    print("note: no spatial_dimensions in the cache, dimension check skipped")
+                    return {}
+                path = str(group_path).strip("/")
+                sizes = {}
+                for tree in trees:
+                    node = tree if path in ("", ".") else tree[path]
+                    for dim, size in node.dataset.sizes.items():
+                        if dim not in spatial:
+                            sizes.setdefault(dim, set()).add(int(size))
+                bad = {dim: sorted(values) for dim, values in sizes.items() if len(values) > 1}
+                if bad:
+                    problems[group_path] = bad
+            return problems
+
+
+        def count_chunks(api, cache, settings, group_path):
+            """Number of output chunks of a spatial group (the bound used by convert_group_to_healpix)."""
+            if settings.group_settings[group_path].chunk.method == "no_chunk":
+                # converted in one piece, chunk_indices are ignored
+                return 1
+            import zarr
+
+            converter = api.init_converter(
+                group_path, cache=cache, settings=settings, output_store=zarr.storage.MemoryStore()
+            )
+            return int(math.ceil(converter.cell_dim_size / converter.cell_dim_chunk_size))
+
+
+        def group_key(group_settings):
+            """(resampler, output level - chunk level) of a chunked group (the key of
+            CHUNK_COST_S and CHUNKS_PER_PROCESS; the difference is None when a level is
+            unknown), None for a no_chunk group (converted in one piece, one task)."""
+            chunk = group_settings.chunk
+            if chunk.method == "no_chunk":
+                return None
+            resampler = getattr(group_settings.resampler, "name", group_settings.resampler)
+            resampler = str(resampler).lower()
+            level = getattr(group_settings.healpix, "refinement_level", None)
+            chunk_level = getattr(getattr(chunk, "healpix", None), "refinement_level", None)
+            if not isinstance(level, int) or not isinstance(chunk_level, int):
+                return resampler, None
+            return resampler, level - chunk_level
+
+
+        def chunk_cost(group_settings):
+            """(estimated seconds per output chunk, from the benchmark table?) of a group,
+            None for a no_chunk group (converted in one piece, one task)."""
+            key = group_key(group_settings)
+            if key is None:
+                return None
+            resampler, d = key
+            factor = 4 if resampler == "psf" else 1
+            if d is None:
+                return CHUNK_COST_FALLBACK * factor, False
+            if key in CHUNK_COST_S:
+                return CHUNK_COST_S[key], True
+            return CHUNK_COST_FALLBACK * 2.0 ** d * factor, False
+
+
+        def chunks_per_process(group_settings):
+            """Chunks converted per process by convert-chunk (CHUNKS_PER_PROCESS); 0 = every
+            chunk of a task in one process (no_chunk groups and keys outside the table)."""
+            return CHUNKS_PER_PROCESS.get(group_key(group_settings), 0)
+
+
+        def task_sizes(chunk_counts, chunk_costs, minimum, limit):
+            """(target seconds per task, {group: chunks per task}).
+
+            A group's tasks hold ceil(target / its cost per chunk) chunks, at least
+            `minimum` (a no_chunk group: one task); target is the smallest that gives at
+            most `limit` tasks, 0 when `minimum` chunks per task already do (if even one
+            task per group exceeds `limit`, one task per group).
+            """
+
+            def sizes(target):
+                out = {}
+                for group, n in chunk_counts.items():
+                    n = max(n, 1)
+                    cost = chunk_costs[group]
+                    out[group] = n if cost is None else min(n, max(minimum, math.ceil(target / cost[0])))
+                return out
+
+            def n_tasks(target):
+                per_task = sizes(target)
+                return sum(math.ceil(n / per_task[g]) for g, n in chunk_counts.items())
+
+            if n_tasks(0.0) <= limit:
+                return 0.0, sizes(0.0)
+            low = 0.0
+            high = max([n * chunk_costs[g][0] for g, n in chunk_counts.items()
+                        if chunk_costs[g] is not None] or [1.0])
+            if n_tasks(high) > limit:
+                return high, sizes(high)
+            for _ in range(200):
+                middle = (low + high) / 2
+                if n_tasks(middle) <= limit:
+                    high = middle
+                else:
+                    low = middle
+                if high - low <= 1e-9 * high:
+                    break
+            return high, sizes(high)
+
+
+        def assign_lanes(tasks, n_lanes):
+            """Longest estimated task first, each to the least loaded lane (LPT). Sets
+            task["lane"]; returns the tasks in that order (a lane then runs its longest
+            task first) and the estimated load of each lane."""
+            loads = [0.0] * n_lanes
+            ordered = sorted(tasks, key=lambda t: -t["estimate"])  # stable: ties keep group order
+            for task in ordered:
+                lane = min(range(n_lanes), key=lambda i: (loads[i], i))
+                task["lane"] = lane
+                loads[lane] += task["estimate"]
+            return ordered, loads
+
+
+        def write_text(name, text):
+            with open(os.path.join(OUT_DIR, name), "w") as f:
+                f.write(text)
+
+
+        def main():
+            try:
+                paths = json.loads(input_paths) if input_paths.strip() else []
+            except ValueError:
+                paths = None
+            if not paths or not isinstance(paths, list) or not all(isinstance(p, str) and p for p in paths):
+                fail(f"input_paths must be a non-empty JSON list of paths, got {input_paths!r}")
+            if not output_path.strip():
+                fail("output_path is empty")
+            selected_groups = parse_groups(groups)
+            min_batch = parse_positive_int("chunks_per_task", chunks_per_task)
+            task_limit = parse_positive_int("max_tasks", max_tasks)
+            max_lanes = parse_positive_int("parallelism", parallelism)
+            # used by convert-chunk, checked here
+            if parse_positive_int("nworkers", nworkers) > 1:
+                print(f"note: nworkers={nworkers} on 1-CPU conversion pods: the workers share one CPU")
+            replace = parse_bool("overwrite", overwrite)
+            extent = parse_output_extent(output_extent)
+            extent_details = parse_extent_info(extent_info)
+            os.makedirs(OUT_DIR, exist_ok=True)
+
+            s3_options = configure_s3(s3_endpoint)
+            output_options = storage_options_for(output_path, s3_options)
+
+            # The only existing-output check of the workflow (see prepare).
+            if output_exists(output_path, output_options):
+                if not replace:
+                    fail(
+                        f"output {output_path} already exists. Set overwrite=true to rebuild it "
+                        "from scratch, or retry the workflow that created it (Argo retry, e.g. "
+                        "retry_workflow of the Python client, see tf/README.md) to re-run only its "
+                        "failed steps.",
+                        EXIT_OUTPUT_EXISTS,
+                    )
+                print(f"WARNING: {output_path} exists and will be replaced (overwrite=true)")
+
+            api = import_api()
+            fix_half_pixel()  # before create_staging_cache: the transforms go into the cache
+            settings = resolve_settings(api, settings_name)
+            print(f"{len(paths)} input dataset(s), groups: {selected_groups or 'all'}")
+            extent_kwargs = {}
+            if extent is not None:
+                extent_kwargs["output_extent"] = extent
+                n_vertices = len(extent.exterior.coords) - 1
+                print(f"output extent: polygon of {n_vertices} vertices, bounds {extent.bounds}")
+            if extent_details:
+                print(f"extent_info: {json.dumps(extent_details)[:500]}")
+            cache = api.create_staging_cache(paths, settings, groups=selected_groups, **extent_kwargs)
+            if not cache.input_spatial_groups:
+                fail("no spatial group to convert to HEALPix in the input dataset(s)")
+
+            groups_out = groups.strip()
+            problems = unmergeable_groups(cache)
+            if problems:
+                for group_path, dims in problems.items():
+                    print(f"WARNING: group /{group_path} left out: dimension sizes differ "
+                          f"between the inputs {dims}")
+                dropped = {"/" + str(p).strip("/") for p in problems}
+                first = next(iter(cache.input_datatrees.values()))
+                kept = [node.path for node in first.subtree
+                        if not any(node.path == d or node.path.startswith(d + "/") for d in dropped)]
+                if not any(path != "/" for path in kept):
+                    fail("no group left to convert")
+                cache = api.create_staging_cache(paths, settings, groups=kept, **extent_kwargs)
+                if not cache.input_spatial_groups:
+                    fail("no spatial group left to convert to HEALPix")
+                groups_out = json.dumps(kept, separators=(",", ":"))
+            check_align_level(settings, cache, extent_details.get("align_level"))
+            report_extent(cache, extent)
+            report_transforms(cache)
+            write_text("cache.json", cache.to_json())
+            write_text("groups", groups_out)
+
+            # keys are PurePath, like those of settings.group_settings
+            chunk_counts, chunk_costs = {}, {}
+            per_process = {}  # chunks per convert-chunk process, 0 = all in one
+            for group_path in cache.input_spatial_groups:
+                chunk_counts[group_path] = count_chunks(api, cache, settings, group_path)
+                chunk_costs[group_path] = chunk_cost(settings.group_settings[group_path])
+                per_process[group_path] = chunks_per_process(settings.group_settings[group_path])
+            if extent is not None:
+                check_extent_chunks(settings, chunk_counts, extent_details)
+
+            target, sizes = task_sizes(chunk_counts, chunk_costs, min_batch, task_limit)
+            tasks = []
+            for group_path, n_chunks in chunk_counts.items():
+                cost = chunk_costs[group_path]
+                size = sizes[group_path]
+                k = per_process[group_path]
+                for start in range(0, n_chunks, size):
+                    stop = min(start + size, n_chunks)
+                    chunk_indices = json.dumps([[start, stop]], separators=(",", ":"))
+                    estimate = None
+                    if cost is not None:
+                        # + start-up of the sub-batch processes after the first
+                        extra = math.ceil((stop - start) / k) - 1 if k else 0
+                        estimate = (stop - start) * cost[0] + extra * PROCESS_START_S
+                    tasks.append({"group": str(group_path), "chunk_indices": chunk_indices,
+                                  "chunks_per_process": k, "estimate": estimate})
+            if not tasks:
+                fail("no output chunk to convert (does output_extent intersect the inputs?)")
+            if len(tasks) > task_limit:
+                print(f"WARNING: {len(tasks)} tasks (one per group) exceed max_tasks={task_limit}")
+            # a no_chunk group (one small grid) counts as an average task
+            known = [t["estimate"] for t in tasks if t["estimate"] is not None]
+            average = sum(known) / len(known) if known else 1.0
+            for task in tasks:
+                if task["estimate"] is None:
+                    task["estimate"] = average
+            n_lanes = min(max_lanes, len(tasks))
+            tasks, loads = assign_lanes(tasks, n_lanes)
+
+            total = sum(chunk_counts.values())
+            print(f"{len(chunk_counts)} spatial group(s), {total} chunk(s), {len(tasks)} task(s), "
+                  f"{n_lanes} lane(s) in parallel; chunks per task from an estimated "
+                  f"{target:.0f} s per task (at least chunks_per_task={min_batch}, max_tasks={task_limit}):")
+            for group_path, n_chunks in chunk_counts.items():
+                method = settings.group_settings[group_path].chunk.method
+                cost = chunk_costs[group_path]
+                n_group = sum(1 for t in tasks if t["group"] == str(group_path))
+                about = "one piece" if cost is None else (
+                    f"~{cost[0]:.3g} s/chunk ({'benchmark' if cost[1] else 'rough'})")
+                k = per_process[group_path]
+                if k and k < sizes[group_path]:
+                    about += f", {k} chunks per process"
+                print(f"  - {group_path}: {n_chunks} chunk(s) ({method}), {n_group} task(s) of up to "
+                      f"{sizes[group_path]} chunk(s), {about}")
+            mean = sum(loads) / n_lanes
+            print(f"lanes: estimated longest {max(loads) / mean:.2f}x the mean, "
+                  f"{min(sum(1 for t in tasks if t['lane'] == i) for i in range(n_lanes))}-"
+                  f"{max(sum(1 for t in tasks if t['lane'] == i) for i in range(n_lanes))} task(s) per lane")
+            if all(c is None or c[1] for c in chunk_costs.values()):
+                biggest = max(t["estimate"] for t in tasks) * CLUSTER_SLOWDOWN
+                print(f"estimate (benchmark x{CLUSTER_SLOWDOWN}, chunks without data counted as full, so "
+                      f"an upper bound): {sum(loads) * CLUSTER_SLOWDOWN / 3600:.0f} CPU-hours, longest lane "
+                      f"{max(loads) * CLUSTER_SLOWDOWN / 3600:.1f} h, longest task {biggest / 3600:.2f} h")
+                if biggest > CONVERT_DEADLINE_S / 2:
+                    print(f"WARNING: the longest task may come close to the {CONVERT_DEADLINE_S} s deadline "
+                          "of convert-chunk: raise max_tasks")
+            for task in tasks:
+                del task["estimate"]
+
+            write_text("tasks.json", json.dumps(tasks, separators=(",", ":")))
+            write_text("lanes.json", json.dumps(list(range(n_lanes))))
+            write_text("n_lanes", str(n_lanes))
+            write_text("n_tasks", str(len(tasks)))
+            write_text("n_chunks", str(total))
+
+
+        if __name__ == "__main__":
+            main()
+
+  - name: prepare
+    retryStrategy:
+      limit: "2"
+      retryPolicy: Always
+      backoff:
+        duration: "30s"
+        factor: "2"
+    activeDeadlineSeconds: 7200
+    inputs:
+      parameters:
+        - name: output_path
+        - name: settings_name
+        - name: groups
+        - name: s3_endpoint
+        - name: healpix_image
+      artifacts:
+        - name: cache
+          path: /tmp/in/cache.json
+    volumes:
+      - name: s3-creds
+        secret:
+          secretName: argo-s3-credentials
+    script:
+      image: "{{inputs.parameters.healpix_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+        limits:
+          cpu: "2"
+          memory: 8Gi
+      volumeMounts:
+        - name: s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+      source: |
+        # Argo parameters (substituted by Argo before the script runs)
+        output_path = "{{inputs.parameters.output_path}}"
+        settings_name = r'''{{inputs.parameters.settings_name}}'''
+        groups = r'''{{inputs.parameters.groups}}'''
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        import importlib
+        import json
+        import os
+        import sys
+        import types
+        from datetime import datetime, timezone
+
+        S3_CREDS_DIR = "/etc/s3"
+        CACHE_FILE = "/tmp/in/cache.json"
+        PUBLIC_READ_PREFIXES = ("s3://grid4earth/public/",)
+        # slow or flaky links: long timeouts and adaptive retries for every S3 client
+        S3_CONFIG_KWARGS = {
+            "connect_timeout": 120,
+            "read_timeout": 600,
+            "retries": {"max_attempts": 10, "mode": "adaptive"},
+        }
+        FIX_HALF_PIXEL = True  # see fix_half_pixel()
+        # finalize renames it to stac_discovery once every chunk is written
+        PENDING_STAC_KEY = "stac_discovery_pending"
+        # properties of the merged item that are not compared with the inputs: written
+        # by healpix-convert itself (format_stac_processing) or set by orbit_properties
+        OWN_PROPERTIES = (
+            "processing:datetime", "processing:software", "processing:expression",
+            "processing:lineage", "datetime", "start_datetime", "end_datetime", "created",
+        )
+        # numeric properties that differ between the input products (tiles): their mean
+        MEAN_PROPERTIES = ("eo:cloud_cover", "eo:snow_cover")
+
+
+        def fail(message, code=1):
+            print(f"ERROR: {message}", flush=True)
+            sys.exit(code)
+
+
+        def read_s3_credentials():
+            """(key, secret) from the mounted secret, or None when it is not mounted."""
+            key_file = os.path.join(S3_CREDS_DIR, "accessKey")
+            secret_file = os.path.join(S3_CREDS_DIR, "secretKey")
+            if not (os.path.isfile(key_file) and os.path.isfile(secret_file)):
+                return None
+            with open(key_file) as f:
+                key = f.read().strip()
+            with open(secret_file) as f:
+                secret = f.read().strip()
+            return key, secret
+
+
+        def configure_s3(endpoint):
+            """Let s3:// paths opened without storage options use the cluster credentials.
+
+            Returns the storage options for explicit S3 access, or None without credentials.
+            """
+            creds = read_s3_credentials()
+            if creds is None:
+                print(f"no S3 credentials in {S3_CREDS_DIR}: s3:// paths are not accessible")
+                return None
+            key, secret = creds
+            os.environ["AWS_ACCESS_KEY_ID"] = key
+            os.environ["AWS_SECRET_ACCESS_KEY"] = secret
+            if endpoint:
+                os.environ["AWS_ENDPOINT_URL"] = endpoint
+            import fsspec.config
+
+            options = {"key": key, "secret": secret, "config_kwargs": S3_CONFIG_KWARGS}
+            if endpoint:
+                options["client_kwargs"] = {"endpoint_url": endpoint}
+            fsspec.config.conf["s3"] = json.loads(json.dumps(options))
+            # the same settings in the processes started from here (dask workers): fsspec
+            # reads FSSPEC_S3 when imported, the credentials come from the AWS_* variables
+            os.environ["FSSPEC_S3"] = json.dumps(
+                {k: v for k, v in options.items() if k not in ("key", "secret")}
+            )
+            return options
+
+
+        def storage_options_for(url, s3_options):
+            if not url.startswith("s3://"):
+                return None
+            if s3_options is None:
+                fail(f"{url} needs S3 credentials in {S3_CREDS_DIR}")
+            options = json.loads(json.dumps(s3_options))
+            if url.startswith(PUBLIC_READ_PREFIXES):
+                options["s3_additional_kwargs"] = {"ACL": "public-read"}
+            return options
+
+
+        _half_pixel = {"corrected": 0}
+
+
+        def same_transform(a, b):
+            """Equal affine transforms (6 coefficients, relative tolerance 1e-9)."""
+            return all(
+                abs(p - q) <= 1e-9 * max(1.0, abs(p), abs(q)) for p, q in zip(tuple(a)[:6], tuple(b)[:6])
+            )
+
+
+        def fix_half_pixel():
+            """Make extract_spatial_info_stac return the pixel-corner transform it is used as.
+
+            For EOPF variables without proj:* attributes it returns rasterix center_transform()
+            of the x/y coordinates, but create_raster_index passes it to
+            RasterIndex.from_transform(), which expects the corner transform: the output is
+            then shifted half a source pixel east and south. Wraps the module attribute (the
+            converter calls utils.extract_spatial_info_stac); no-op for a transform that
+            already is the corner one (fixed upstream) or comes from proj:transform.
+            """
+            if not FIX_HALF_PIXEL:
+                print("half-pixel correction disabled (FIX_HALF_PIXEL = False)")
+                return
+            for name in ("healpix_convert.core.utils", "legacy_converters.core.utils"):
+                try:
+                    module = importlib.import_module(name)
+                except ImportError:
+                    continue
+                original = getattr(module, "extract_spatial_info_stac", None)
+                if original is None or getattr(original, "g4e_patched", False):
+                    continue
+
+                def extract(ds, *args, _original=original, _module=module, **kwargs):
+                    info = _original(ds, *args, **kwargs)
+                    transforms = (info or {}).get("transform")
+                    if not transforms or len(transforms) != 1 or not ds.data_vars:
+                        return info
+                    attrs = next(iter(ds.data_vars.values())).attrs
+                    get_crs = getattr(_module, "_get_stac_proj_crs", None)
+                    if get_crs is not None:
+                        has_proj = get_crs(attrs) is not None
+                    else:
+                        has_proj = any(str(key).startswith("proj:") for key in attrs)
+                    if has_proj or "x" not in ds.variables or "y" not in ds.variables:
+                        return info  # proj:transform: already the corner transform
+                    import rasterix
+
+                    index = rasterix.assign_index(ds, x_dim="x", y_dim="y", crs=False).xindexes["x"]
+                    corner, center = index.transform(), index.center_transform()
+                    current = transforms[0]
+                    if same_transform(current, corner):
+                        return info  # fixed upstream
+                    if not same_transform(current, center):
+                        print(f"WARNING: unexpected transform {tuple(current)[:6]} (corner "
+                              f"{tuple(corner)[:6]}), half-pixel correction not applied", flush=True)
+                        return info
+                    _half_pixel["corrected"] += 1
+                    if _half_pixel["corrected"] == 1:
+                        print(f"half-pixel correction ({_module.__name__}.extract_spatial_info_stac, "
+                              f"logged once): pixel-center origin ({current.c}, {current.f}) -> "
+                              f"pixel-corner origin ({corner.c}, {corner.f}), pixel size "
+                              f"{corner.a} x {corner.e}", flush=True)
+                    return dict(info, transform=[corner])
+
+                extract.g4e_patched = True
+                module.extract_spatial_info_stac = extract
+
+
+        def import_api():
+            try:
+                from healpix_convert import ConvertSettings, ConvertStagingCache, prepare_healpix_dataset
+                from legacy_converters import get_settings
+                import healpix_convert as package
+            except ImportError:
+                from legacy_converters import (
+                    ConvertSettings,
+                    ConvertStagingCache,
+                    get_settings,
+                    prepare_healpix_dataset,
+                )
+                import legacy_converters as package
+            print(f"converter: {package.__name__} {getattr(package, '__version__', '?')}")
+            return types.SimpleNamespace(
+                ConvertSettings=ConvertSettings,
+                ConvertStagingCache=ConvertStagingCache,
+                get_settings=get_settings,
+                prepare_healpix_dataset=prepare_healpix_dataset,
+            )
+
+
+        def resolve_settings(api, name):
+            text = name.strip()
+            if text.startswith("{"):
+                settings = api.ConvertSettings.model_validate_json(text)
+            else:
+                settings = api.get_settings(text)
+            if not isinstance(settings, api.ConvertSettings):
+                settings = api.ConvertSettings.model_validate(settings.model_dump())
+            return settings
+
+
+        def parse_groups(text):
+            """None (all groups), a glob pattern, or a list of absolute group paths."""
+            text = text.strip()
+            if not text:
+                return None
+            value = json.loads(text)
+            if isinstance(value, str):
+                return value
+            return ["/" + g.strip("/") for g in value]
+
+
+        def restrict_to_groups(cache, selected_groups):
+            """Re-apply the group selection of create_staging_cache.
+
+            ConvertStagingCache.from_json re-opens the input datasets in full, but
+            prepare_healpix_dataset looks up every group of the first input in
+            cache.output_groups.io_path_map, which only knows the selected groups.
+            Same filtering as healpix_convert.cache._check_and_filter_input_groups.
+            """
+            if selected_groups is None:
+                return cache
+            paths = list(cache.input_datatrees)
+            trees = list(cache.input_datatrees.values())
+            if isinstance(selected_groups, str):
+                selection = trees[0].match(selected_groups)
+            else:
+                selection = trees[0].filter(lambda node: node.path in selected_groups)
+            cache.input_datatrees = {p: t.filter_like(selection) for p, t in zip(paths, trees)}
+            return cache
+
+
+        def merge_stac_lists_as_union():
+            """healpix-convert merges the inputs' root STAC items and fails on any
+            difference outside id/bbox/geometry/properties/links/assets, but stores
+            written by different eopf versions (or the EOPF Sample Service) list
+            different stac_extensions. Merge list values as an ordered union instead."""
+            for name in ("healpix_convert.stac_operations", "legacy_converters.stac_operations"):
+                try:
+                    module = importlib.import_module(name)
+                except ImportError:
+                    continue
+                original = getattr(module, "_merge_no_conflicts", None)
+                if original is None or getattr(original, "g4e_patched", False):
+                    continue
+
+                def merge(values, original=original):
+                    if values and all(isinstance(v, list) for v in values):
+                        merged = []
+                        for value in values:
+                            for entry in value:
+                                if entry not in merged:
+                                    merged.append(entry)
+                        return merged
+                    return original(values)
+
+                merge.g4e_patched = True
+                module._merge_no_conflicts = merge
+
+
+        def parse_time(text):
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+        def orbit_properties(properties, input_items):
+            """Properties of the merged item. healpix-convert keeps those of the FIRST
+            input (one tile of the orbit), so:
+              - proj:* is dropped (it does not describe the HEALPix grid);
+              - start_datetime / end_datetime = time range of all inputs (datetime = start);
+              - created = processing time;
+              - a property whose value differs between the inputs (tile-specific, e.g.
+                eopf:datastrip_id) is dropped, except eo:cloud_cover / eo:snow_cover
+                (MEAN_PROPERTIES): mean over the inputs that have it.
+            """
+            properties = {k: v for k, v in properties.items() if not k.startswith("proj:")}
+            inputs = [((item or {}).get("properties") or {}) for item in input_items]
+            starts, ends = [], []
+            for p in inputs:
+                start = p.get("start_datetime") or p.get("datetime")
+                end = p.get("end_datetime") or p.get("datetime")
+                if start:
+                    starts.append(start)
+                if end:
+                    ends.append(end)
+            try:
+                if starts and ends:
+                    start, end = min(starts, key=parse_time), max(ends, key=parse_time)
+                    properties["start_datetime"] = start
+                    properties["end_datetime"] = end
+                    if properties.get("datetime"):
+                        properties["datetime"] = start
+            except ValueError as exc:
+                print(f"WARNING: time range not updated ({exc})")
+            properties["created"] = (
+                datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            )
+            averaged, dropped = [], []
+            for key in sorted(properties):
+                if key in OWN_PROPERTIES:
+                    continue
+                values = [p.get(key) for p in inputs]
+                if len({json.dumps(v, sort_keys=True, default=str) for v in values}) <= 1:
+                    continue  # the same in every input (or a single input)
+                numbers = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+                if key in MEAN_PROPERTIES and numbers:
+                    properties[key] = round(sum(numbers) / len(numbers), 4)
+                    averaged.append(f"{key}={properties[key]}")
+                else:
+                    del properties[key]
+                    dropped.append(key)
+            if averaged:
+                print(f"STAC properties, mean of {len(inputs)} inputs: {', '.join(averaged)}")
+            if dropped:
+                print(f"STAC properties that differ between the inputs, dropped: {', '.join(dropped)}")
+            return properties
+
+
+        def put_attrs(group, attrs):
+            if hasattr(group.attrs, "put"):
+                group.attrs.put(attrs)
+            else:
+                for key in [k for k in group.attrs if k not in attrs]:
+                    del group.attrs[key]
+                group.attrs.update(attrs)
+
+
+        def hold_back_stac(output_options, cache):
+            """stac_discovery -> PENDING_STAC_KEY (stac-scraper indexes every store whose
+            root has stac_discovery; this one has no data yet), with orbit properties."""
+            import zarr
+
+            root = zarr.open_group(output_path, mode="r+", storage_options=output_options)
+            attrs = dict(root.attrs)
+            item = attrs.pop("stac_discovery", None)
+            if not isinstance(item, dict):
+                fail("prepare_healpix_dataset wrote no stac_discovery")
+            inputs = [tree.attrs.get("stac_discovery") for tree in cache.input_datatrees.values()]
+            item["properties"] = orbit_properties(item.get("properties") or {}, inputs)
+            attrs[PENDING_STAC_KEY] = item
+            put_attrs(root, attrs)
+            zarr.consolidate_metadata(root.store)
+            props = item["properties"]
+            print(f"STAC item {item.get('id')} held back until finalize: "
+                  f"{props.get('start_datetime')} / {props.get('end_datetime')}")
+
+
+        def main():
+            s3_options = configure_s3(s3_endpoint)
+            output_options = storage_options_for(output_path, s3_options)
+
+            api = import_api()
+            fix_half_pixel()
+            merge_stac_lists_as_union()
+            settings = resolve_settings(api, settings_name)
+            with open(CACHE_FILE) as f:
+                cache = api.ConvertStagingCache.from_json(f.read())
+            cache = restrict_to_groups(cache, parse_groups(groups))
+
+            # No existing-output check here: stage-cache checked it before anything was
+            # written, and chunk tasks only start once prepare succeeded, so whatever is
+            # at output_path now was left by a failed attempt of this step. Mode "w"
+            # inside prepare_healpix_dataset deletes it.
+            print(f"creating {output_path} from {len(cache.input_datatrees)} input dataset(s)")
+            tree = api.prepare_healpix_dataset(
+                cache, settings, output_path, output_storage_options=output_options
+            )
+            print(f"prepared {len(tree.groups)} group(s):")
+            for path in tree.groups:
+                node = tree[path]
+                if node.data_vars:
+                    print(f"  - {path}: {dict(node.sizes)} {sorted(node.data_vars)}")
+            hold_back_stac(output_options, cache)
+
+
+        if __name__ == "__main__":
+            main()
+
+  - name: lane-tasks
+    retryStrategy:
+      limit: "3"
+      retryPolicy: Always
+      backoff:
+        duration: "10s"
+        factor: "2"
+    activeDeadlineSeconds: 900
+    inputs:
+      parameters:
+        - name: lane
+        - name: n_lanes
+        - name: healpix_image
+      artifacts:
+        - name: tasks
+          path: /tmp/in/tasks.json
+    outputs:
+      parameters:
+        - name: tasks
+          valueFrom:
+            path: /tmp/out/lane_tasks.json
+    script:
+      image: "{{inputs.parameters.healpix_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      source: |
+        # Argo parameters (substituted by Argo before the script runs)
+        lane = "{{inputs.parameters.lane}}"
+        n_lanes = "{{inputs.parameters.n_lanes}}"
+
+        import json
+        import os
+
+        TASKS_FILE = "/tmp/in/tasks.json"
+        OUT_DIR = "/tmp/out"
+
+
+        def main():
+            with open(TASKS_FILE) as f:
+                tasks = json.load(f)
+            index, count = int(lane), int(n_lanes)
+            # stage-cache balances the lanes ("lane" field); round-robin without it
+            mine = [t for i, t in enumerate(tasks) if t.get("lane", i % count) == index]
+            os.makedirs(OUT_DIR, exist_ok=True)
+            with open(os.path.join(OUT_DIR, "lane_tasks.json"), "w") as f:
+                json.dump(mine, f, separators=(",", ":"))
+            print(f"lane {lane}/{n_lanes}: {len(mine)} of {len(tasks)} task(s)")
+
+
+        if __name__ == "__main__":
+            main()
+
+  - name: convert-chunk
+    retryStrategy:
+      # S3 timeouts / proxy errors: 4 retries, 1, 2, 4 and 8 minutes apart
+      limit: "4"
+      retryPolicy: Always
+      # exit code 2 = invalid arguments, or a resampler error that a retry would
+      # repeat ("No HEALPix cell passed the threshold"): retrying cannot help
+      expression: 'lastRetry.exitCode != "2"'
+      backoff:
+        duration: "1m"
+        factor: "2"
+    # per attempt; also bounds a pod stuck in Pending (ImagePullBackOff)
+    activeDeadlineSeconds: 14400
+    inputs:
+      parameters:
+        - name: group
+        - name: chunk_indices
+        - name: chunks_per_process
+        - name: output_path
+        - name: settings_name
+        - name: nworkers
+        - name: s3_endpoint
+        - name: healpix_image
+      artifacts:
+        - name: cache
+          path: /tmp/in/cache.json
+    volumes:
+      - name: s3-creds
+        secret:
+          secretName: argo-s3-credentials
+    script:
+      image: "{{inputs.parameters.healpix_image}}"
+      command:
+        - python
+      # One thread per process (see "Conversion pods" in the header): without these,
+      # OpenMP / BLAS / numexpr / rayon (healpix-geo, called with num_threads=0 by
+      # healpix-resample) and torch start one thread per node core in a 1-CPU quota.
+      # Inherited by the dask worker processes when nworkers > 1.
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        - name: OMP_NUM_THREADS
+          value: "1"
+        - name: MKL_NUM_THREADS
+          value: "1"
+        - name: OPENBLAS_NUM_THREADS
+          value: "1"
+        - name: NUMEXPR_NUM_THREADS
+          value: "1"
+        - name: RAYON_NUM_THREADS
+          value: "1"
+      # 1 CPU: four 1-thread pods convert more than twice as much as one 4-thread pod
+      # (see "Conversion pods" in the header). Memory: a chunk needs at most ~1.7 GiB
+      # (10 m nearest groups); the sub-batches in new processes (chunks_per_process)
+      # keep the memory the allocators hold after each chunk from piling up over a
+      # task. 4 Gi requested (14 pods per b3-64 node), 8 Gi limit as headroom.
+      resources:
+        requests:
+          cpu: "1"
+          memory: 4Gi
+        limits:
+          cpu: "1"
+          memory: 8Gi
+      volumeMounts:
+        - name: s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+      source: |
+        # Argo parameters (substituted by Argo before the script runs)
+        group = "{{inputs.parameters.group}}"
+        chunk_indices = r'''{{inputs.parameters.chunk_indices}}'''
+        chunks_per_process = "{{inputs.parameters.chunks_per_process}}"
+        output_path = "{{inputs.parameters.output_path}}"
+        settings_name = r'''{{inputs.parameters.settings_name}}'''
+        nworkers = "{{inputs.parameters.nworkers}}"
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        import importlib
+        import json
+        import os
+        import resource
+        import subprocess
+        import sys
+        import time
+        import types
+
+        S3_CREDS_DIR = "/etc/s3"
+        CACHE_FILE = "/tmp/in/cache.json"
+        # command-line flag of the sub-batch processes (this script run again, see
+        # convert_in_sub_batches): "<script> --sub-batch '<chunk_indices JSON>'"
+        SUB_BATCH_FLAG = "--sub-batch"
+        PUBLIC_READ_PREFIXES = ("s3://grid4earth/public/",)
+        # slow or flaky links: long timeouts and adaptive retries for every S3 client
+        S3_CONFIG_KWARGS = {
+            "connect_timeout": 120,
+            "read_timeout": 600,
+            "retries": {"max_attempts": 10, "mode": "adaptive"},
+        }
+        FIX_HALF_PIXEL = True  # see fix_half_pixel()
+        EXIT_INVALID = 2  # not retried by the retryStrategy
+        # message of the deterministic resampler error (healpix_resample KNeighborsResampler)
+        RESAMPLER_NO_CELL = "No HEALPix cell passed the threshold"
+
+
+        def fail(message, code=EXIT_INVALID):
+            print(f"ERROR: {message}", flush=True)
+            sys.exit(code)
+
+
+        def read_s3_credentials():
+            """(key, secret) from the mounted secret, or None when it is not mounted."""
+            key_file = os.path.join(S3_CREDS_DIR, "accessKey")
+            secret_file = os.path.join(S3_CREDS_DIR, "secretKey")
+            if not (os.path.isfile(key_file) and os.path.isfile(secret_file)):
+                return None
+            with open(key_file) as f:
+                key = f.read().strip()
+            with open(secret_file) as f:
+                secret = f.read().strip()
+            return key, secret
+
+
+        def configure_s3(endpoint):
+            """Let s3:// paths opened without storage options use the cluster credentials.
+
+            Must run before the dask cluster starts: the worker processes inherit the
+            AWS_* variables. Returns the storage options for explicit S3 access, or None
+            without credentials.
+            """
+            creds = read_s3_credentials()
+            if creds is None:
+                print(f"no S3 credentials in {S3_CREDS_DIR}: s3:// paths are not accessible")
+                return None
+            key, secret = creds
+            os.environ["AWS_ACCESS_KEY_ID"] = key
+            os.environ["AWS_SECRET_ACCESS_KEY"] = secret
+            if endpoint:
+                os.environ["AWS_ENDPOINT_URL"] = endpoint
+            import fsspec.config
+
+            options = {"key": key, "secret": secret, "config_kwargs": S3_CONFIG_KWARGS}
+            if endpoint:
+                options["client_kwargs"] = {"endpoint_url": endpoint}
+            fsspec.config.conf["s3"] = json.loads(json.dumps(options))
+            # the same settings in the processes started from here (dask workers): fsspec
+            # reads FSSPEC_S3 when imported, the credentials come from the AWS_* variables
+            os.environ["FSSPEC_S3"] = json.dumps(
+                {k: v for k, v in options.items() if k not in ("key", "secret")}
+            )
+            return options
+
+
+        def storage_options_for(url, s3_options):
+            if not url.startswith("s3://"):
+                return None
+            if s3_options is None:
+                fail(f"{url} needs S3 credentials in {S3_CREDS_DIR}", 1)
+            options = json.loads(json.dumps(s3_options))
+            if url.startswith(PUBLIC_READ_PREFIXES):
+                options["s3_additional_kwargs"] = {"ACL": "public-read"}
+            return options
+
+
+        _half_pixel = {"corrected": 0}
+
+
+        def same_transform(a, b):
+            """Equal affine transforms (6 coefficients, relative tolerance 1e-9)."""
+            return all(
+                abs(p - q) <= 1e-9 * max(1.0, abs(p), abs(q)) for p, q in zip(tuple(a)[:6], tuple(b)[:6])
+            )
+
+
+        def fix_half_pixel():
+            """Make extract_spatial_info_stac return the pixel-corner transform it is used as.
+
+            For EOPF variables without proj:* attributes it returns rasterix center_transform()
+            of the x/y coordinates, but create_raster_index passes it to
+            RasterIndex.from_transform(), which expects the corner transform: the output is
+            then shifted half a source pixel east and south. Wraps the module attribute (the
+            converter calls utils.extract_spatial_info_stac); no-op for a transform that
+            already is the corner one (fixed upstream) or comes from proj:transform.
+            """
+            if not FIX_HALF_PIXEL:
+                print("half-pixel correction disabled (FIX_HALF_PIXEL = False)")
+                return
+            for name in ("healpix_convert.core.utils", "legacy_converters.core.utils"):
+                try:
+                    module = importlib.import_module(name)
+                except ImportError:
+                    continue
+                original = getattr(module, "extract_spatial_info_stac", None)
+                if original is None or getattr(original, "g4e_patched", False):
+                    continue
+
+                def extract(ds, *args, _original=original, _module=module, **kwargs):
+                    info = _original(ds, *args, **kwargs)
+                    transforms = (info or {}).get("transform")
+                    if not transforms or len(transforms) != 1 or not ds.data_vars:
+                        return info
+                    attrs = next(iter(ds.data_vars.values())).attrs
+                    get_crs = getattr(_module, "_get_stac_proj_crs", None)
+                    if get_crs is not None:
+                        has_proj = get_crs(attrs) is not None
+                    else:
+                        has_proj = any(str(key).startswith("proj:") for key in attrs)
+                    if has_proj or "x" not in ds.variables or "y" not in ds.variables:
+                        return info  # proj:transform: already the corner transform
+                    import rasterix
+
+                    index = rasterix.assign_index(ds, x_dim="x", y_dim="y", crs=False).xindexes["x"]
+                    corner, center = index.transform(), index.center_transform()
+                    current = transforms[0]
+                    if same_transform(current, corner):
+                        return info  # fixed upstream
+                    if not same_transform(current, center):
+                        print(f"WARNING: unexpected transform {tuple(current)[:6]} (corner "
+                              f"{tuple(corner)[:6]}), half-pixel correction not applied", flush=True)
+                        return info
+                    _half_pixel["corrected"] += 1
+                    if _half_pixel["corrected"] == 1:
+                        print(f"half-pixel correction ({_module.__name__}.extract_spatial_info_stac, "
+                              f"logged once): pixel-center origin ({current.c}, {current.f}) -> "
+                              f"pixel-corner origin ({corner.c}, {corner.f}), pixel size "
+                              f"{corner.a} x {corner.e}", flush=True)
+                    return dict(info, transform=[corner])
+
+                extract.g4e_patched = True
+                module.extract_spatial_info_stac = extract
+
+
+        def import_api():
+            try:
+                from healpix_convert import ConvertSettings, ConvertStagingCache, convert_group_to_healpix
+                from legacy_converters import get_settings
+                import healpix_convert as package
+                converters = "healpix_convert.healpix_converters"
+            except ImportError:
+                from legacy_converters import (
+                    ConvertSettings,
+                    ConvertStagingCache,
+                    convert_group_to_healpix,
+                    get_settings,
+                )
+                import legacy_converters as package
+                converters = "legacy_converters.healpix_converters"
+            print(f"converter: {package.__name__} {getattr(package, '__version__', '?')}")
+            return types.SimpleNamespace(
+                ConvertSettings=ConvertSettings,
+                ConvertStagingCache=ConvertStagingCache,
+                convert_group_to_healpix=convert_group_to_healpix,
+                get_settings=get_settings,
+                converters=converters,
+            )
+
+
+        def resolve_settings(api, name):
+            text = name.strip()
+            if text.startswith("{"):
+                settings = api.ConvertSettings.model_validate_json(text)
+            else:
+                settings = api.get_settings(text)
+            if not isinstance(settings, api.ConvertSettings):
+                settings = api.ConvertSettings.model_validate(settings.model_dump())
+            return settings
+
+
+        def points_in_chunk(converter, points, chunk_cell_id):
+            """True if at least one input point lies inside the chunk cell (its HEALPix
+            cell at the output level is one of the chunk's cells; nested scheme)."""
+            import healpix_geo
+            import numpy as np
+
+            level = converter.healpix.refinement_level
+            chunk_level = converter.chunk_healpix.refinement_level
+            ellipsoid = getattr(converter.healpix.ellipsoid, "name", converter.healpix.ellipsoid)
+            cell_ids = healpix_geo.nested.lonlat_to_healpix(
+                np.asarray(points["lon"].values, dtype="float64"),
+                np.asarray(points["lat"].values, dtype="float64"),
+                level,
+                ellipsoid=str(ellipsoid).upper(),
+            )
+            parents = np.asarray(cell_ids, dtype="uint64") >> np.uint64(2 * (level - chunk_level))
+            return bool(np.any(parents == np.uint64(chunk_cell_id)))
+
+
+        def skip_empty_chunks(module_name):
+            """Leave a chunk empty (cell ids and fill values) instead of failing in the
+            resampler ("No HEALPix cell passed the threshold", deterministic) when
+              - the query selects 0 input points: a buffered chunk polygon that only
+                grazes an input tile (no pixel centre in the overlap);
+              - the dense converter uses the "nearest" resampler, which is forced to
+                fill exactly the chunk's cells, and every selected point lies in the
+                chunk buffer zone, outside the chunk cell (e.g. along the outer edge of
+                the input tiles): no forced cell is near a point.
+            Both are treated like a chunk without input."""
+            module = importlib.import_module(module_name)
+            cls = getattr(module, "UniformChunkConverter", None) or getattr(module, "DenseChunkConverter", None)
+            if cls is None or getattr(cls.query_input_points, "g4e_patched", False):
+                return
+            original = cls.query_input_points
+            dense = getattr(module, "DenseChunkConverter", None)
+
+            def query_input_points(self, chunk_cell_id):
+                points = original(self, chunk_cell_id)
+                if points is None:
+                    return None
+                n_points = points.sizes.get("points", 1)
+                if n_points == 0:
+                    print(f"chunk cell {chunk_cell_id}: no input point, left empty", flush=True)
+                    return None
+                forced = (
+                    dense is not None
+                    and isinstance(self, dense)
+                    and getattr(self.settings.resampler, "name", None) == "nearest"
+                )
+                if forced and not points_in_chunk(self, points, chunk_cell_id):
+                    print(f"chunk cell {chunk_cell_id}: {n_points} input point(s), all in the "
+                          "chunk buffer zone (nearest resampler), left empty", flush=True)
+                    return None
+                return points
+
+            query_input_points.g4e_patched = True
+            cls.query_input_points = query_input_points
+
+
+        def float64_resampler_coordinates(module_name):
+            """The resamplers fail ("Index put requires the source and destination dtypes
+            match") when given float32 longitudes / latitudes, which the no_chunk groups
+            pass as stored (e.g. Sentinel-2 conditions/meteorology). Cast them to float64."""
+            import numpy as np
+
+            module = importlib.import_module(module_name)
+            classes = getattr(module, "_RESAMPLER_NAME_CLS", None)
+            if not isinstance(classes, dict):
+                return
+            for name, cls in list(classes.items()):
+                if getattr(cls, "g4e_patched", False):
+                    continue
+
+                def make(*args, _cls=cls, **kwargs):
+                    for key in ("lon_deg", "lat_deg"):
+                        if kwargs.get(key) is not None:
+                            kwargs[key] = np.asarray(kwargs[key], dtype="float64")
+                    return _cls(*args, **kwargs)
+
+                make.g4e_patched = True
+                classes[name] = make
+
+
+        def patch_converter(module_name):
+            fix_half_pixel()
+            skip_empty_chunks(module_name)
+            float64_resampler_coordinates(module_name)
+
+
+        def patch_converter_on_workers(client, module_name):
+            """Apply patch_converter in every dask worker process (also restarted ones)."""
+            from distributed.diagnostics.plugin import WorkerPlugin
+
+            class PatchConverter(WorkerPlugin):
+                name = "g4e-patch-converter"
+
+                def setup(self, worker):
+                    patch_converter(module_name)
+
+            register = getattr(client, "register_plugin", None) or client.register_worker_plugin
+            register(PatchConverter())
+
+
+        def parse_chunk_indices(text):
+            """JSON list of chunk indices and/or [start, stop) ranges -> list of ints."""
+            try:
+                items = json.loads(text)
+            except ValueError:
+                items = None
+            if not isinstance(items, list):
+                fail(f"chunk_indices must be a JSON list, got {text!r}")
+            indices = []
+            for item in items:
+                if isinstance(item, int):
+                    indices.append(item)
+                elif isinstance(item, list) and len(item) == 2 and all(isinstance(i, int) for i in item):
+                    indices.extend(range(item[0], item[1]))
+                else:
+                    fail(f"invalid chunk_indices item {item!r} in {text}")
+            if not indices:
+                fail(f"no chunk index in {text}")
+            return indices
+
+
+        def parse_positive_int(name, text):
+            try:
+                value = int(text)
+            except ValueError:
+                value = 0
+            if value < 1:
+                fail(f"{name} must be a positive integer, got {text!r}")
+            return value
+
+
+        def parse_non_negative_int(name, text):
+            try:
+                value = int(text)
+            except ValueError:
+                value = -1
+            if value < 0:
+                fail(f"{name} must be a non-negative integer, got {text!r}")
+            return value
+
+
+        def as_ranges(indices):
+            """Chunk indices -> chunk_indices JSON, consecutive runs as [start, stop) ranges."""
+            items = []
+            for index in indices:
+                if items and items[-1][1] == index:
+                    items[-1][1] = index + 1
+                else:
+                    items.append([index, index + 1])
+            return json.dumps(items, separators=(",", ":"))
+
+
+        def peak_rss_gib(who):
+            """Peak RSS (GiB) of this process (resource.RUSAGE_SELF) or of the largest
+            finished child process (resource.RUSAGE_CHILDREN)."""
+            peak = resource.getrusage(who).ru_maxrss
+            return peak / 2**30 if sys.platform == "darwin" else peak / 2**20  # bytes / KiB
+
+
+        def limit_threads():
+            """One torch thread (the pod has 1 CPU; OMP_NUM_THREADS etc. are set in the
+            pod environment, see the template)."""
+            try:
+                import torch
+            except ImportError:
+                return
+            torch.set_num_threads(1)
+
+
+        def convert(indices, indices_text, n_workers):
+            """Convert the chunks in this process (convert_group_to_healpix)."""
+            start = time.monotonic()
+            limit_threads()
+            s3_options = configure_s3(s3_endpoint)
+            output_options = storage_options_for(output_path, s3_options)
+
+            api = import_api()
+            patch_converter(api.converters)
+            settings = resolve_settings(api, settings_name)
+            with open(CACHE_FILE) as f:
+                cache = api.ConvertStagingCache.from_json(f.read())
+
+            cluster = client = None
+            if n_workers > 1:
+                from dask.distributed import LocalCluster
+
+                cluster = LocalCluster(n_workers=n_workers, threads_per_worker=1, dashboard_address=None)
+                client = cluster.get_client()
+                patch_converter_on_workers(client, api.converters)
+
+            print(f"group {group}: {len(indices)} chunk(s), {indices[0]}..{indices[-1]}, "
+                  f"{n_workers} worker(s); set-up {time.monotonic() - start:.1f} s "
+                  "(imports, cache, inputs)", flush=True)
+            try:
+                # writes whole output chunks only, so re-running a task (retry) is harmless
+                api.convert_group_to_healpix(
+                    group,
+                    cache=cache,
+                    settings=settings,
+                    output_path=output_path,
+                    chunk_indices=indices,
+                    output_storage_options=output_options,
+                )
+            except RuntimeError as exc:
+                # deterministic (same inputs, same settings): do not retry
+                if RESAMPLER_NO_CELL not in str(exc):
+                    raise
+                fail(f"group {group}, chunks {indices_text}: the resampler kept no output "
+                     f"cell ({exc}); not a case skip_empty_chunks handles")
+            finally:
+                if client is not None:
+                    client.close()
+                    cluster.close()
+            peak = peak_rss_gib(resource.RUSAGE_SELF)
+            print(f"done in {time.monotonic() - start:.0f} s, peak RSS {peak:.2f} GiB", flush=True)
+
+
+        def convert_in_sub_batches(indices, size):
+            """Convert the chunks in even sub-batches of at most `size` chunks, one after
+            another, each in a new Python process (this script run again with
+            SUB_BATCH_FLAG), so that the memory kept by the allocators after each chunk
+            (see "Conversion pods" in the header) is given back to the system after every
+            sub-batch instead of piling up over the whole task. A failed sub-batch fails
+            the task with its exit code (2 is not retried; a process killed by signal N,
+            e.g. at the memory limit, gives 128 + N), after its own output and traceback;
+            the next attempt converts every sub-batch again (whole chunks are rewritten,
+            which is harmless)."""
+            count = -(-len(indices) // size)  # ceil
+            bounds = [round(i * len(indices) / count) for i in range(count + 1)]
+            batches = [indices[bounds[i]:bounds[i + 1]] for i in range(count)]
+            script = os.path.abspath(__file__)
+            sizes = sorted({len(batch) for batch in batches})
+            print(f"group {group}: {len(indices)} chunk(s), {indices[0]}..{indices[-1]}, in "
+                  f"{count} sub-batches of {'-'.join(map(str, sizes))} chunks (chunks_per_process "
+                  f"{size}), each in a new process", flush=True)
+            start = time.monotonic()
+            for number, batch in enumerate(batches, 1):
+                text = as_ranges(batch)
+                print(f"sub-batch {number}/{len(batches)}: chunks {text}", flush=True)
+                began = time.monotonic()
+                code = subprocess.run([sys.executable, script, SUB_BATCH_FLAG, text]).returncode
+                if code != 0:
+                    killed = f" (killed by signal {-code})" if code < 0 else ""
+                    fail(f"sub-batch {number}/{len(batches)} of group {group} (chunks {text}) failed "
+                         f"with exit code {code}{killed}, see its output above",
+                         code if code > 0 else 128 - code)
+                print(f"sub-batch {number}/{len(batches)} done in {time.monotonic() - began:.0f} s",
+                      flush=True)
+            print(f"done in {time.monotonic() - start:.0f} s, {len(batches)} processes, peak RSS of a "
+                  f"sub-batch process {peak_rss_gib(resource.RUSAGE_CHILDREN):.2f} GiB", flush=True)
+
+
+        def main():
+            sub_batch = len(sys.argv) == 3 and sys.argv[1] == SUB_BATCH_FLAG
+            indices_text = sys.argv[2] if sub_batch else chunk_indices
+            indices = parse_chunk_indices(indices_text)
+            n_workers = parse_positive_int("nworkers", nworkers)
+            # 0 = every chunk of the task in this process (set by stage-cache per group)
+            per_process = parse_non_negative_int("chunks_per_process", chunks_per_process)
+            if sub_batch or per_process == 0 or len(indices) <= per_process:
+                convert(indices, indices_text, n_workers)
+            else:
+                convert_in_sub_batches(indices, per_process)
+
+
+        if __name__ == "__main__":
+            main()
+
+  - name: finalize
+    retryStrategy:
+      limit: "2"
+      retryPolicy: Always
+      # exit code 2 = incomplete output: retrying cannot help (retry the workflow instead)
+      expression: 'lastRetry.exitCode != "2"'
+      backoff:
+        duration: "30s"
+        factor: "2"
+    activeDeadlineSeconds: 3600
+    inputs:
+      parameters:
+        - name: output_path
+        - name: settings_name
+        - name: output_extent
+        - name: extent_info
+        - name: s3_endpoint
+        - name: healpix_image
+      artifacts:
+        - name: cache
+          path: /tmp/in/cache.json
+    outputs:
+      parameters:
+        - name: output_path
+          valueFrom:
+            path: /tmp/out/output_path
+        - name: stac_item_id
+          valueFrom:
+            path: /tmp/out/stac_item_id
+    volumes:
+      - name: s3-creds
+        secret:
+          secretName: argo-s3-credentials
+    script:
+      image: "{{inputs.parameters.healpix_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+        limits:
+          cpu: "2"
+          memory: 8Gi
+      volumeMounts:
+        - name: s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+      source: |
+        # Argo parameters (substituted by Argo before the script runs)
+        output_path = "{{inputs.parameters.output_path}}"
+        settings_name = r'''{{inputs.parameters.settings_name}}'''
+        output_extent = r'''{{inputs.parameters.output_extent}}'''
+        extent_info = r'''{{inputs.parameters.extent_info}}'''
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        import importlib
+        import json
+        import os
+        import re
+        import sys
+        import types
+        from pathlib import PurePath
+
+        S3_CREDS_DIR = "/etc/s3"
+        CACHE_FILE = "/tmp/in/cache.json"
+        OUT_DIR = "/tmp/out"
+        PUBLIC_READ_PREFIXES = ("s3://grid4earth/public/",)
+        # slow or flaky links: long timeouts and adaptive retries for every S3 client
+        S3_CONFIG_KWARGS = {
+            "connect_timeout": 120,
+            "read_timeout": 600,
+            "retries": {"max_attempts": 10, "mode": "adaptive"},
+        }
+        FIX_HALF_PIXEL = True  # see fix_half_pixel()
+        PENDING_STAC_KEY = "stac_discovery_pending"  # written by prepare
+        ORBIT_EXTENT_KEY = "orbit_extent"  # root attribute holding extent_info
+        # root attribute holding the conversion settings, i.e. the processing:expression
+        # object of healpix-convert, which is removed from the STAC item
+        SETTINGS_KEY = "healpix_convert_settings"
+        EXIT_INCOMPLETE = 2  # not retried by the retryStrategy
+        # public URLs of the objects under these prefixes (STAC links and lineage)
+        PUBLIC_URLS = {"s3://grid4earth/public/": "https://data.grid4earth.eu/"}
+        # links copied from the first input item that do not describe the output
+        DROPPED_LINK_RELS = ("self", "root", "parent", "collection")
+        LINEAGE_PREFIX = "Resampled onto HEALPix by healpix-convert from "
+        # degrees (~1 cm): the union of the cells is snapped to this grid AFTER an exact
+        # union (snap-rounding during the union leaves thin false holes along cell edges)
+        GEOMETRY_GRID_SIZE = 1e-7
+        ZARR_METADATA_KEYS = ("zarr.json", ".zarray", ".zattrs", ".zgroup", ".zmetadata")
+
+
+        def fail(message, code=1):
+            print(f"ERROR: {message}", flush=True)
+            sys.exit(code)
+
+
+        def read_s3_credentials():
+            """(key, secret) from the mounted secret, or None when it is not mounted."""
+            key_file = os.path.join(S3_CREDS_DIR, "accessKey")
+            secret_file = os.path.join(S3_CREDS_DIR, "secretKey")
+            if not (os.path.isfile(key_file) and os.path.isfile(secret_file)):
+                return None
+            with open(key_file) as f:
+                key = f.read().strip()
+            with open(secret_file) as f:
+                secret = f.read().strip()
+            return key, secret
+
+
+        def configure_s3(endpoint):
+            """Let s3:// paths opened without storage options use the cluster credentials.
+
+            Returns the storage options for explicit S3 access, or None without credentials.
+            """
+            creds = read_s3_credentials()
+            if creds is None:
+                print(f"no S3 credentials in {S3_CREDS_DIR}: s3:// paths are not accessible")
+                return None
+            key, secret = creds
+            os.environ["AWS_ACCESS_KEY_ID"] = key
+            os.environ["AWS_SECRET_ACCESS_KEY"] = secret
+            if endpoint:
+                os.environ["AWS_ENDPOINT_URL"] = endpoint
+            import fsspec.config
+
+            options = {"key": key, "secret": secret, "config_kwargs": S3_CONFIG_KWARGS}
+            if endpoint:
+                options["client_kwargs"] = {"endpoint_url": endpoint}
+            fsspec.config.conf["s3"] = json.loads(json.dumps(options))
+            # the same settings in the processes started from here (dask workers): fsspec
+            # reads FSSPEC_S3 when imported, the credentials come from the AWS_* variables
+            os.environ["FSSPEC_S3"] = json.dumps(
+                {k: v for k, v in options.items() if k not in ("key", "secret")}
+            )
+            return options
+
+
+        def storage_options_for(url, s3_options):
+            if not url.startswith("s3://"):
+                return None
+            if s3_options is None:
+                fail(f"{url} needs S3 credentials in {S3_CREDS_DIR}")
+            options = json.loads(json.dumps(s3_options))
+            if url.startswith(PUBLIC_READ_PREFIXES):
+                options["s3_additional_kwargs"] = {"ACL": "public-read"}
+            return options
+
+
+        _half_pixel = {"corrected": 0}
+
+
+        def same_transform(a, b):
+            """Equal affine transforms (6 coefficients, relative tolerance 1e-9)."""
+            return all(
+                abs(p - q) <= 1e-9 * max(1.0, abs(p), abs(q)) for p, q in zip(tuple(a)[:6], tuple(b)[:6])
+            )
+
+
+        def fix_half_pixel():
+            """Make extract_spatial_info_stac return the pixel-corner transform it is used as.
+
+            For EOPF variables without proj:* attributes it returns rasterix center_transform()
+            of the x/y coordinates, but create_raster_index passes it to
+            RasterIndex.from_transform(), which expects the corner transform: the output is
+            then shifted half a source pixel east and south. Wraps the module attribute (the
+            converter calls utils.extract_spatial_info_stac); no-op for a transform that
+            already is the corner one (fixed upstream) or comes from proj:transform.
+            """
+            if not FIX_HALF_PIXEL:
+                print("half-pixel correction disabled (FIX_HALF_PIXEL = False)")
+                return
+            for name in ("healpix_convert.core.utils", "legacy_converters.core.utils"):
+                try:
+                    module = importlib.import_module(name)
+                except ImportError:
+                    continue
+                original = getattr(module, "extract_spatial_info_stac", None)
+                if original is None or getattr(original, "g4e_patched", False):
+                    continue
+
+                def extract(ds, *args, _original=original, _module=module, **kwargs):
+                    info = _original(ds, *args, **kwargs)
+                    transforms = (info or {}).get("transform")
+                    if not transforms or len(transforms) != 1 or not ds.data_vars:
+                        return info
+                    attrs = next(iter(ds.data_vars.values())).attrs
+                    get_crs = getattr(_module, "_get_stac_proj_crs", None)
+                    if get_crs is not None:
+                        has_proj = get_crs(attrs) is not None
+                    else:
+                        has_proj = any(str(key).startswith("proj:") for key in attrs)
+                    if has_proj or "x" not in ds.variables or "y" not in ds.variables:
+                        return info  # proj:transform: already the corner transform
+                    import rasterix
+
+                    index = rasterix.assign_index(ds, x_dim="x", y_dim="y", crs=False).xindexes["x"]
+                    corner, center = index.transform(), index.center_transform()
+                    current = transforms[0]
+                    if same_transform(current, corner):
+                        return info  # fixed upstream
+                    if not same_transform(current, center):
+                        print(f"WARNING: unexpected transform {tuple(current)[:6]} (corner "
+                              f"{tuple(corner)[:6]}), half-pixel correction not applied", flush=True)
+                        return info
+                    _half_pixel["corrected"] += 1
+                    if _half_pixel["corrected"] == 1:
+                        print(f"half-pixel correction ({_module.__name__}.extract_spatial_info_stac, "
+                              f"logged once): pixel-center origin ({current.c}, {current.f}) -> "
+                              f"pixel-corner origin ({corner.c}, {corner.f}), pixel size "
+                              f"{corner.a} x {corner.e}", flush=True)
+                    return dict(info, transform=[corner])
+
+                extract.g4e_patched = True
+                module.extract_spatial_info_stac = extract
+
+
+        def import_api():
+            try:
+                from healpix_convert import ConvertSettings
+                from legacy_converters import get_settings
+                utils = "healpix_convert.core.utils"
+            except ImportError:
+                from legacy_converters import ConvertSettings, get_settings
+                utils = "legacy_converters.core.utils"
+            return types.SimpleNamespace(
+                ConvertSettings=ConvertSettings,
+                get_settings=get_settings,
+                utils=importlib.import_module(utils),
+            )
+
+
+        def resolve_settings(api, name):
+            text = name.strip()
+            if text.startswith("{"):
+                settings = api.ConvertSettings.model_validate_json(text)
+            else:
+                settings = api.get_settings(text)
+            if not isinstance(settings, api.ConvertSettings):
+                settings = api.ConvertSettings.model_validate(settings.model_dump())
+            return settings
+
+
+        def put_attrs(group, attrs):
+            if hasattr(group.attrs, "put"):
+                group.attrs.put(attrs)
+            else:
+                for key in [k for k in group.attrs if k not in attrs]:
+                    del group.attrs[key]
+                group.attrs.update(attrs)
+
+
+        def public_url(path):
+            """Public URL of an input path; None for a local path or a private object."""
+            text = str(path).strip()
+            for prefix, url in PUBLIC_URLS.items():
+                if text.startswith(prefix):
+                    return url + text[len(prefix):]
+            if text.startswith(("https://", "http://")):
+                return text
+            return None
+
+
+        def clean_links(links):
+            """Links without self/root/parent/collection, derived_from with public URLs only."""
+            kept, seen, dropped = [], set(), 0
+            for link in links or []:
+                if not isinstance(link, dict) or link.get("rel") in DROPPED_LINK_RELS:
+                    continue
+                if link.get("rel") == "derived_from":
+                    href = public_url(link.get("href", ""))
+                    if href is None:
+                        dropped += 1
+                        continue
+                    link = dict(link, href=href)
+                key = (link.get("rel"), link.get("href"))
+                if key not in seen:
+                    seen.add(key)
+                    kept.append(link)
+            if dropped:
+                print(f"dropped {dropped} derived_from link(s) to local or private paths")
+            return kept
+
+
+        def clean_lineage(value):
+            """processing:lineage naming the public URLs of the inputs only."""
+            if isinstance(value, list):
+                return [clean_lineage(v) for v in value]
+            if not isinstance(value, str):
+                return value
+            if not value.startswith(LINEAGE_PREFIX):
+                for prefix, url in PUBLIC_URLS.items():
+                    value = value.replace(prefix, url)
+                return value
+            paths = [p.strip() for p in value[len(LINEAGE_PREFIX):].split(", ") if p.strip()]
+            urls = [url for url in map(public_url, paths) if url]
+            others = len(paths) - len(urls)
+            described = ", ".join(urls)
+            if others:
+                described += (f" and {others} other" if urls else f"{others}") + " input dataset(s)"
+            return LINEAGE_PREFIX + described
+
+
+        def stored_chunk_indices(fs, array_path, array):
+            """Chunk indices along the last (cell) dimension of the chunks stored for an array
+            (zarr does not store a chunk that holds only fill values)."""
+            shards = getattr(array, "shards", None)
+            per_key = shards[-1] // array.chunks[-1] if shards else 1
+            prefix = array_path.rstrip("/") + "/"
+            indices = set()
+            for key in fs.find(array_path):
+                rel = key[len(prefix):] if key.startswith(prefix) else ""
+                if not rel or rel.rsplit("/", 1)[-1] in ZARR_METADATA_KEYS:
+                    continue
+                if rel[:2] in ("c/", "c."):
+                    rel = rel[2:]
+                parts = re.split(r"[./]", rel)
+                if len(parts) != array.ndim or not all(part.isdigit() for part in parts):
+                    continue
+                start = int(parts[-1]) * per_key
+                indices.update(range(start, start + per_key))
+            return indices
+
+
+        def group_data_cells(api, root, fs, root_path, geometry, output_group, group_settings):
+            """(chunk level, ellipsoid, chunk-level cell ids with stored data, array name) of a
+            dense group, None for the other chunk methods."""
+            import numpy as np
+
+            chunk = group_settings.chunk
+            if chunk.method != "healpix_cell_dense":
+                return None
+            level = group_settings.healpix.refinement_level
+            chunk_level = chunk.healpix.refinement_level
+            ellipsoid = getattr(chunk.healpix.ellipsoid, "name", chunk.healpix.ellipsoid)
+            coordinate = getattr(group_settings.healpix, "coordinate", "cell_ids")
+            group = root[output_group]
+            cell_ids = group[coordinate]
+            size = cell_ids.chunks[-1]
+            if size != 4 ** (level - chunk_level):
+                raise ValueError(f"{output_group}: {size} cells per chunk, not 4**({level}-{chunk_level})")
+            # the chunk cells, in chunk order, as the converter computed them
+            chunk_ids, _ = api.utils.compute_output_chunk_info(geometry, chunk_level, ellipsoid)
+            chunk_ids = np.asarray(chunk_ids, dtype="uint64")
+            if chunk_ids.size * size != cell_ids.shape[-1]:
+                raise ValueError(f"{output_group}: {chunk_ids.size} chunk cells for {cell_ids.shape[-1]} cells")
+            arrays = sorted(
+                (name, array)
+                for name, array in group.arrays()
+                if name != coordinate and array.ndim >= 1
+                and array.shape[-1] == cell_ids.shape[-1] and array.chunks[-1] == size
+            )
+            if not arrays:
+                raise ValueError(f"{output_group}: no data array along the cell dimension")
+            name, array = arrays[0]
+            stored = sorted(i for i in stored_chunk_indices(fs, f"{root_path}/{output_group}/{name}", array)
+                            if i < chunk_ids.size)
+            shift = 2 * (level - chunk_level)
+            for index in sorted({stored[0], stored[-1]} if stored else ()):
+                first = int(cell_ids[index * size])
+                if first >> shift != int(chunk_ids[index]):
+                    raise ValueError(f"{output_group}: chunk {index} holds cell {first}, "
+                                     f"not a child of chunk cell {int(chunk_ids[index])}")
+            return chunk_level, str(ellipsoid).upper(), chunk_ids[stored], name
+
+
+        def cells_union(cells):
+            """Union (lon/lat polygon) of HEALPix cells given as {(level, ellipsoid): ids}."""
+            import healpix_geo
+            import numpy as np
+            import shapely
+
+            polygons = []
+            for (level, ellipsoid), ids in sorted(cells.items()):
+                ids = np.unique(np.asarray(sorted(ids), dtype="uint64"))
+                lon, lat = healpix_geo.nested.vertices(ids, level, ellipsoid=ellipsoid)
+                lon = (np.asarray(lon) + 180.0) % 360.0 - 180.0
+                if np.any(lon.max(axis=1) - lon.min(axis=1) > 180.0):
+                    raise ValueError("cells crossing the antimeridian are not supported")
+                polygons.extend(shapely.polygons(np.stack([lon, np.asarray(lat)], axis=-1)))
+            if not polygons:
+                raise ValueError("no stored data chunk")
+            # exact union first (neighbouring cells share bit-identical vertices), then
+            # snap: union_all(grid_size=...) snap-rounds while it merges and leaves dozens
+            # of 1e-7 deg wide triangular holes along cell edges (52 for orbit 4025)
+            union = shapely.set_precision(shapely.union_all(polygons), GEOMETRY_GRID_SIZE)
+            if union.is_empty or union.geom_type not in ("Polygon", "MultiPolygon"):
+                raise ValueError(f"union of the cells is a {union.geom_type}")
+            # a hole smaller than 1 % of the smallest cell is a numerical sliver, not a
+            # missing chunk
+            min_hole = 0.01 * float(shapely.area(polygons).min())
+            parts = [shapely.Polygon(p.exterior, [r for r in p.interiors
+                                                  if shapely.Polygon(r).area >= min_hole])
+                     for p in getattr(union, "geoms", [union])]
+            union = parts[0] if union.geom_type == "Polygon" else shapely.MultiPolygon(parts)
+            if hasattr(shapely, "orient_polygons"):
+                union = shapely.orient_polygons(union)  # exterior counter-clockwise (RFC 7946)
+            return union
+
+
+        def data_geometry(api, root, settings, cache, output_options):
+            """Union of the chunk-level HEALPix cells holding stored data chunks (one
+            representative data array per dense group)."""
+            import fsspec.core
+            import shapely.geometry
+
+            fs, root_path = fsspec.core.url_to_fs(output_path, **(output_options or {}))
+            root_path = root_path.rstrip("/")
+            geometry = shapely.geometry.shape(cache["output_spatial"]["geometry_latlon"])
+            io_path_map = cache["output_groups"]["io_path_map"]
+            cells = {}
+            for input_group in sorted(cache["input_spatial_groups"]):
+                output_group = io_path_map[input_group]
+                found = group_data_cells(api, root, fs, root_path, geometry, output_group,
+                                         settings.group_settings[PurePath(input_group)])
+                if found is None:
+                    continue
+                chunk_level, ellipsoid, ids, name = found
+                cells.setdefault((chunk_level, ellipsoid), set()).update(int(i) for i in ids)
+                print(f"  - {output_group}: {len(ids)} chunk(s) with data ({name}), level {chunk_level}")
+            union = cells_union(cells)
+            n_cells = sum(len(ids) for ids in cells.values())
+            print(f"geometry: union of {n_cells} chunk-level HEALPix cell(s) with data, "
+                  f"{union.geom_type} of {len(shapely.get_coordinates(union))} vertices")
+            return union
+
+
+        def output_geometry(api, root, settings, cache, output_options):
+            """(geometry, source): the cells with data, else output_extent, else None (keep)."""
+            import shapely.geometry
+
+            try:
+                return data_geometry(api, root, settings, cache, output_options), "data chunks"
+            except Exception as exc:
+                print(f"WARNING: no geometry from the stored chunks ({type(exc).__name__}: {exc})")
+            if output_extent.strip():
+                try:
+                    return shapely.geometry.shape(json.loads(output_extent)), "output_extent"
+                except Exception as exc:
+                    print(f"WARNING: invalid output_extent ({type(exc).__name__}: {exc})")
+            return None, "prepare (unchanged)"
+
+
+        def clean_stac_item(item, geometry):
+            """(the root STAC item as stac-scraper should index it, see the header
+            comment; the processing:expression removed from it, None if absent)."""
+            import shapely
+            import shapely.geometry
+
+            item = dict(item)
+            properties = {k: v for k, v in (item.get("properties") or {}).items() if not k.startswith("proj:")}
+            # the settings object of healpix-convert: the other items of the catalogue
+            # have the string "systematic" (rustac's geoparquet writer fails on mixed
+            # types) and the processing v1.2.0 schema requires an object; an absent
+            # field fits both
+            expression = properties.pop("processing:expression", None)
+            if "processing:lineage" in properties:
+                properties["processing:lineage"] = clean_lineage(properties["processing:lineage"])
+            item["properties"] = properties
+            # no proj:* left anywhere (assets are dropped)
+            item["stac_extensions"] = [u for u in item.get("stac_extensions") or [] if "/projection/" not in u]
+            item["assets"] = {}
+            item["links"] = clean_links(item.get("links"))
+            if geometry is not None:
+                item["geometry"] = json.loads(shapely.to_geojson(geometry))
+            try:
+                west, south, east, north = shapely.geometry.shape(item["geometry"]).bounds
+                item["bbox"] = [west, south, east, north]
+            except Exception as exc:
+                print(f"WARNING: bbox not recomputed ({type(exc).__name__}: {exc})")
+            return item, expression
+
+
+        def parse_extent_info(text):
+            """extent_info (validated by stage-cache) as a dict; {} if unusable."""
+            try:
+                value = json.loads(text.strip() or "{}")
+            except ValueError:
+                value = None
+            if not isinstance(value, dict):
+                print(f"WARNING: extent_info is not a JSON object, not stored: {text[:80]!r}")
+                return {}
+            return value
+
+
+        def main():
+            s3_options = configure_s3(s3_endpoint)
+            output_options = storage_options_for(output_path, s3_options)
+
+            import xarray as xr
+            import zarr
+
+            api = import_api()
+            fix_half_pixel()
+            settings = resolve_settings(api, settings_name)
+            # plain JSON: the group layout is all that is needed here, re-opening the
+            # inputs with ConvertStagingCache.from_json would only cost time
+            with open(CACHE_FILE) as f:
+                cache = json.load(f)
+            spatial_groups = set(cache["input_spatial_groups"])
+            io_path_map = cache["output_groups"]["io_path_map"]
+
+            root = zarr.open_group(output_path, mode="r+", storage_options=output_options)
+
+            # every chunk task of a dense group writes the cell ids of its chunks, so a
+            # missing cell id chunk means a chunk that was never converted. (A task that
+            # failed after writing the cell ids of a chunk is not detected here, but a
+            # failed task fails the run before finalize.)
+            problems = []
+            for input_group in sorted(spatial_groups):
+                output_group = io_path_map[input_group]
+                group_settings = settings.group_settings[PurePath(input_group)]
+                coordinate = getattr(group_settings.healpix, "coordinate", "cell_ids")
+                method = group_settings.chunk.method
+                if not isinstance(coordinate, str) or f"{output_group}/{coordinate}" not in root:
+                    problems.append(f"{output_group}: no {coordinate} array")
+                    continue
+                cell_ids = root[f"{output_group}/{coordinate}"]
+                written, expected = cell_ids.nchunks_initialized, cell_ids.nchunks
+                print(f"  - {output_group} ({method}): {written}/{expected} cell id chunk(s) written")
+                if method == "healpix_cell_dense" and written != expected:
+                    problems.append(f"{output_group}: {expected - written} chunk(s) missing")
+                elif written == 0:
+                    # e.g. no_chunk groups with legacy_converters de458eb, which skips them
+                    print(f"WARNING: {output_group} has no data (not converted by this converter version?)")
+            if problems:
+                fail("incomplete output (re-run the failed tasks with an Argo retry of the workflow, "
+                     "e.g. retry_workflow of the Python client, see tf/README.md):\n  "
+                     + "\n  ".join(problems), EXIT_INCOMPLETE)
+
+            # every array and group is written: consolidate, then clean the STAC item
+            # held back by prepare and publish it (stac-scraper indexes the dataset from
+            # then on), then consolidate again for the new root attributes
+            zarr.consolidate_metadata(root.store)
+            root = zarr.open_group(output_path, mode="r+", storage_options=output_options)
+            attrs = dict(root.attrs)
+            item = attrs.pop(PENDING_STAC_KEY, None)
+            if item is None:
+                # a retry after the publication: clean it again (idempotent)
+                item = attrs.get("stac_discovery")
+            if not isinstance(item, dict):
+                fail("the root group has neither stac_discovery nor " + PENDING_STAC_KEY, EXIT_INCOMPLETE)
+            geometry, source = output_geometry(api, root, settings, cache, output_options)
+            item, expression = clean_stac_item(item, geometry)
+            print(f"STAC item cleaned: geometry from {source}, bbox {item.get('bbox')}, "
+                  f"{len(item['links'])} link(s), no assets")
+            attrs["stac_discovery"] = item
+            if expression is not None:
+                # (a retry after the publication finds it there already)
+                attrs[SETTINGS_KEY] = expression
+                print(f"processing:expression moved to the root attribute {SETTINGS_KEY}")
+            orbit_extent = parse_extent_info(extent_info)
+            if orbit_extent:
+                attrs[ORBIT_EXTENT_KEY] = orbit_extent
+            # one write: the item is published and the pending marker removed together
+            put_attrs(root, attrs)
+            print("published the root stac_discovery")
+            zarr.consolidate_metadata(root.store)
+            print(f"consolidated metadata of {output_path}")
+
+            tree = xr.open_datatree(
+                output_path,
+                engine="zarr",
+                storage_options=output_options,
+                chunks={},
+                create_default_indexes=False,
+            )
+            print("output groups:")
+            for path in tree.groups:
+                node = tree[path]
+                if node.data_vars:
+                    size = sum(v.nbytes for v in node.data_vars.values()) / 1e9
+                    print(f"  - {path}: {dict(node.sizes)} {sorted(node.data_vars)} ({size:.2f} GB)")
+            stac = tree.attrs.get("stac_discovery")
+            if not isinstance(stac, dict) or not stac.get("id"):
+                fail("the root group has no stac_discovery item (with an id)", EXIT_INCOMPLETE)
+            if PENDING_STAC_KEY in tree.attrs:
+                fail(f"{PENDING_STAC_KEY} is still in the root attributes")
+            props = stac.get("properties", {})
+            print(f"stac_discovery id: {stac['id']}")
+            print(f"bbox: {stac.get('bbox')}, datetime: {props.get('datetime')} "
+                  f"({props.get('start_datetime')} / {props.get('end_datetime')})")
+            if ORBIT_EXTENT_KEY in tree.attrs:
+                print(f"{ORBIT_EXTENT_KEY}: {json.dumps(tree.attrs[ORBIT_EXTENT_KEY])[:300]}")
+
+            os.makedirs(OUT_DIR, exist_ok=True)
+            with open(os.path.join(OUT_DIR, "output_path"), "w") as f:
+                f.write(output_path)
+            with open(os.path.join(OUT_DIR, "stac_item_id"), "w") as f:
+                f.write(stac["id"])
+
+
+        if __name__ == "__main__":
+            main()

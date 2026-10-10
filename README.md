@@ -48,7 +48,9 @@ names every component, namespace, node pool, bucket and registry.
    `legacy-converters-sentinel-3` WorkflowTemplate reads an EOPF Zarr product from
    the EOPF Sample Service STAC, converts it with `legacy-converters` (HEALPix
    nested, WGS84 ellipsoid) and writes the result to the `g4e-desp-argo-artifacts`
-   bucket.
+   bucket. The `orbit-to-healpix-pipeline` WorkflowTemplate mirrors all the CDSE products of one
+   orbit over France into `eopf-mirror/`, converts the strip to one HEALPix Zarr in `converted/`
+   and refreshes the STAC index (`stac-scraper-update`), see [`tf/README.md`](tf/README.md#orbit-pipeline).
 4. **Published datasets** live under `s3://grid4earth/public/` (`converted/`,
    `eopf-mirror/`, `auxiliary/`, see the bucket layout in
    [project-guidelines](https://github.com/GRID4EARTH/project-guidelines)). The

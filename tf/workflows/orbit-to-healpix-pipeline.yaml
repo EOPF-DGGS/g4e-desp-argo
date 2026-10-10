@@ -1,0 +1,743 @@
+# End-to-end orbit pipeline: every Sentinel product of ONE satellite orbit (same
+# sat:absolute_orbit) over a region -> EOPF Zarr in eopf-mirror/ -> ONE HEALPix
+# Zarr in converted/ -> public STAC index refreshed.
+#
+#   check-arguments  runs on orbit_image before anything is downloaded or written:
+#                    validates the arguments, resolves settings_name with the
+#                    converter, checks that the S3 and CDSE secrets exist and, with
+#                    update_stac=true, that stac-scraper is installed. A missing
+#                    orbit_image fails it after activeDeadlineSeconds (15 min).
+#   mirror           cdse-orbit-to-eopf-mirror/main: CDSE query, then one pod per
+#                    product (Sample Service copy or CDSE SAFE download + eopf).
+#   convert          healpix-convert-multistage/main on the mirrored stores
+#                    (input_paths = mirror.mirror_paths,
+#                    output_path = mirror.healpix_output_path,
+#                    output_extent / extent_info = mirror.output_extent /
+#                    mirror.extent_info).
+#   update-stac      stac-scraper-update/main, only when update_stac == "true": re-indexes
+#                    eopf-mirror/<g4e collection> and converted/<g4e collection> under
+#                    s3://grid4earth/public only (include_categories, built from
+#                    mirror.orbit) and merges their collections into collections.json.
+#                    check-arguments therefore requires the default mirror_prefix /
+#                    converted_prefix and a stac-scraper collection template for the
+#                    collection when update_stac=true (set update_stac=false otherwise).
+#
+# The three templates must be deployed in the argo namespace first (see
+# tf/README.md, "Orbit pipeline"). templateRef does not carry the callee's
+# serviceAccountName / imagePullSecrets / spec-level volumes, so they are set
+# here and every called template declares its own volumes.
+#
+# settings_name selects the legacy_converters settings. They are named after the
+# G4E collection (sentinel-2-l2a, sentinel-3-olci-l1-efr, ... and the *-psf
+# variants of Sentinel-3), so it MUST match the collection: the default
+# "sentinel-2-l2a" only fits collection=sentinel-2-l2a. An empty settings_name is
+# replaced by the G4E collection id of `collection`; an inline ConvertSettings
+# JSON document (starting with "{") is passed as is. check-arguments stops the
+# run when the name does not match the collection.
+#
+# Images: eopf_image converts SAFE to EOPF Zarr; healpix_image runs the CDSE query
+# (needs pystac-client); orbit_image (healpix-convert + legacy-converters main +
+# stac-scraper) runs the argument check, the HEALPix conversion and the STAC
+# update. With the older healpix_image as orbit_image the conversion falls back
+# to the legacy_converters bundled converter (the no_chunk groups stay empty) and
+# update-stac cannot run (no stac-scraper): set update_stac=false then.
+#
+# Region: by default (lat_range=45.0,49.0) the orbit is cut as the latitude band
+# 45..49 N (Massif Central to Paris; the preset "france" = 41.3..51.2 stays
+# available) over the full swath width, snapped to HEALPix cells of align_level
+# (default 7, nested, WGS84; align_rule intersects or within) so that regional
+# products of different orbits line up. The union of the kept cells is ONE
+# polygon, passed to the conversion as output_extent (GeoJSON, drawn so that the
+# output chunks inside the kept cells are converted; checked by the query at level
+# 11 and by stage-cache per group, with a WARNING otherwise) with extent_info
+# (JSON, stored in the output). The output is cut per chunk, so align_level must
+# not exceed the chunk level of the settings (S2: 11, S3: 6, S3 PSF: 7; checked
+# by check-arguments: set align_level=6 for the Sentinel-3 settings). bbox then only
+# picks the pass when the orbit crosses the band twice (SLSTR day / night). With
+# lat_range "" (or "none") the products are selected with bbox (empty = whole
+# orbit) and the output is not clipped. See cdse-orbit-to-eopf-mirror for the
+# details.
+# The output is named {platform}_{type}_{first sensing start}_R{relative orbit}_
+# O{absolute orbit}_{region}: region_name if given (upper-cased; a band-shaped name
+# keeps a lower-case "p"), else FRANCE for the preset, else the band tag
+# (45.0,49.0 -> N45-N49, 41.3,51.2 -> N41p3-N51p2), e.g.
+# converted/sentinel-2-l2a/S2C_MSIL2A_20250613T104641_R051_O4025_N45-N49.zarr.
+#
+# Conversion sizing (see healpix-convert-multistage): one conversion pod = 1 CPU
+# (4 Gi requested, 8 Gi limit, one thread; the 10 m and 20 m groups are converted in
+# sub-batches of ~5 min, each in a new process, so that memory does not pile up),
+# convert_parallelism (default 48) pods at a time, at most max_tasks (default 500)
+# pods in all. For S2C orbit 4025 in 45..49 N with every group: ~155-160 CPU-hours,
+# ~3.9 h of conversion with 48 pods (about 4 b3-64 nodes), ~3.1 h with 64, ~6 h with
+# 32 (the longest lane is ~1.2x the mean: chunks without data gather in some tasks).
+#
+# Re-running on the same orbit: mirrored products are skipped, but the
+# conversion refuses an existing output unless overwrite=true. To resume a run
+# whose chunk tasks failed, retry the workflow instead (Argo retry: retry_workflow
+# of the Python client, see tf/README.md).
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: orbit-to-healpix-pipeline
+  namespace: argo
+spec:
+  entrypoint: main
+  serviceAccountName: argo-workflow
+  imagePullSecrets:
+    - name: harbor-pull-secret
+  # backstop for the whole run (the steps have their own, shorter deadlines)
+  activeDeadlineSeconds: 604800
+  # a run creates hundreds of pods; logs of successful ones stay readable for a day
+  podGC:
+    strategy: OnPodSuccess
+    deleteDelayDuration: 24h
+  arguments:
+    parameters:
+      # --- orbit selection (cdse-orbit-to-eopf-mirror) ---
+      - name: collection
+        value: sentinel-2-l2a
+        description: CDSE STAC collection id (sentinel-2-l1c, sentinel-2-l2a, sentinel-3-olci-1-efr-ntc, ...)
+      - name: reference_item
+        value: ""
+        description: CDSE item id of one product of the orbit; platform, orbits and time window are taken from it (leave the manual parameters empty)
+      - name: platform
+        value: ""
+        description: manual mode (no reference_item), e.g. sentinel-2c
+      - name: relative_orbit
+        value: ""
+        description: manual mode, sat:relative_orbit
+      - name: absolute_orbit
+        value: ""
+        description: manual mode, sat:absolute_orbit (filtered client-side)
+      - name: datetime
+        value: ""
+        description: manual mode, STAC datetime range start/end (required without reference_item)
+      - name: lat_range
+        value: "45.0,49.0"
+        description: latitude band min,max (deg, default 45..49 N) or "france" (41.3,51.2), cut over the full swath width and snapped to align_level cells; empty (or "none") = select with bbox
+      - name: align_level
+        value: "7"
+        description: HEALPix level (nested, WGS84) of the parent cells the band is snapped to, 0..11 and not above the chunk level of settings_name (S2 11, S3 6, S3 PSF 7)
+      - name: align_rule
+        value: intersects
+        enum: ["intersects", "within"]
+        description: keep a cell that intersects swath and band (intersects) or only cells entirely inside the band (within)
+      - name: bbox
+        value: ""
+        description: minx,miny,maxx,maxy or "france"; with lat_range it only picks the pass (orbit crossing the band twice); without lat_range it is the region (empty = whole orbit)
+      - name: region_name
+        value: ""
+        description: last part of the HEALPix output name (letters, digits and '-', upper-cased; the 'p' of a band-shaped name stays lower case); empty = the band tag (lat_range 45.0,49.0 -> N45-N49, 41.3,... -> N41p3-...), FRANCE for lat_range "france" (or, without lat_range, the France bbox), else REGION
+      - name: check_sample_service
+        value: "true"
+        enum: ["true", "false"]
+        description: copy the products from the EOPF Sample Service when it has every product of the orbit
+      - name: max_items
+        value: "1000"
+        description: CDSE search limit; the query fails when it is reached
+      - name: mirror_prefix
+        value: s3://grid4earth/public/eopf-mirror
+      - name: converted_prefix
+        value: s3://grid4earth/public/converted
+      # --- HEALPix conversion (healpix-convert-multistage) ---
+      - name: settings_name
+        value: sentinel-2-l2a
+        description: legacy_converters settings, MUST match collection (G4E id, e.g. sentinel-3-olci-l1-efr); empty = derived from collection
+      - name: groups
+        value: ""
+        description: empty = all groups, else a JSON list of input group paths (or a JSON string glob pattern)
+      - name: chunks_per_task
+        value: "16"
+        description: minimum number of output chunks per conversion pod (raised per group from its estimated cost so that the tasks take about the same time and stay within max_tasks)
+      - name: max_tasks
+        value: "500"
+        description: upper bound on the number of conversion pods of the run
+      - name: convert_parallelism
+        value: "48"
+        description: conversion pods (1 CPU, 4-8 Gi each) running at the same time (= lanes); 48 needs about 4 b3-64 nodes
+      - name: nworkers
+        value: "1"
+        description: dask worker processes per conversion pod; the pods have 1 CPU, so keep 1 (no dask cluster)
+      - name: overwrite
+        value: "false"
+        enum: ["true", "false"]
+        description: replace an existing HEALPix output
+      # --- STAC index (stac-scraper-update) ---
+      - name: update_stac
+        value: "true"
+        enum: ["true", "false"]
+        description: after the conversion, re-index eopf-mirror/<collection> and converted/<collection> of s3://grid4earth/public (only these two; collections.json is merged, nothing removed)
+      - name: stac_dry_run
+        value: "false"
+        enum: ["true", "false"]
+        description: build the STAC index without uploading it (kept as the stac-index artifact)
+      # --- common ---
+      - name: s3_endpoint
+        value: https://s3.gra.io.cloud.ovh.net
+      - name: eopf_image
+        value: y74y55mn.gra7.container-registry.ovh.net/healpix-private/s2msi:fefecebf
+        description: SAFE to EOPF Zarr (eopf, s2msi)
+      - name: healpix_image
+        value: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-01
+        description: CDSE query (pystac-client)
+      - name: orbit_image
+        value: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-10-orbit
+        description: argument check, HEALPix conversion and STAC update (healpix-convert, legacy-converters, stac-scraper)
+  templates:
+  - name: main
+    inputs:
+      parameters:
+        - name: collection
+        - name: reference_item
+        - name: platform
+        - name: relative_orbit
+        - name: absolute_orbit
+        - name: datetime
+        - name: lat_range
+        - name: align_level
+        - name: align_rule
+        - name: bbox
+        - name: region_name
+        - name: check_sample_service
+        - name: max_items
+        - name: mirror_prefix
+        - name: converted_prefix
+        - name: settings_name
+        - name: groups
+        - name: chunks_per_task
+        - name: max_tasks
+        - name: convert_parallelism
+        - name: nworkers
+        - name: overwrite
+        - name: update_stac
+        - name: stac_dry_run
+        - name: s3_endpoint
+        - name: eopf_image
+        - name: healpix_image
+        - name: orbit_image
+    outputs:
+      parameters:
+        - name: orbit
+          valueFrom:
+            parameter: "{{tasks.mirror.outputs.parameters.orbit}}"
+        - name: output_extent
+          valueFrom:
+            parameter: "{{tasks.mirror.outputs.parameters.output_extent}}"
+        - name: extent_info
+          valueFrom:
+            parameter: "{{tasks.mirror.outputs.parameters.extent_info}}"
+        - name: healpix_output_path
+          valueFrom:
+            parameter: "{{tasks.convert.outputs.parameters.output_path}}"
+        - name: stac_item_id
+          valueFrom:
+            parameter: "{{tasks.convert.outputs.parameters.stac_item_id}}"
+    dag:
+      tasks:
+        - name: check-arguments
+          template: check-arguments
+          arguments:
+            parameters:
+              - name: collection
+                value: "{{inputs.parameters.collection}}"
+              - name: reference_item
+                value: "{{inputs.parameters.reference_item}}"
+              - name: platform
+                value: "{{inputs.parameters.platform}}"
+              - name: relative_orbit
+                value: "{{inputs.parameters.relative_orbit}}"
+              - name: absolute_orbit
+                value: "{{inputs.parameters.absolute_orbit}}"
+              - name: datetime
+                value: "{{inputs.parameters.datetime}}"
+              - name: lat_range
+                value: "{{inputs.parameters.lat_range}}"
+              - name: align_level
+                value: "{{inputs.parameters.align_level}}"
+              - name: align_rule
+                value: "{{inputs.parameters.align_rule}}"
+              - name: bbox
+                value: "{{inputs.parameters.bbox}}"
+              - name: region_name
+                value: "{{inputs.parameters.region_name}}"
+              - name: check_sample_service
+                value: "{{inputs.parameters.check_sample_service}}"
+              - name: max_items
+                value: "{{inputs.parameters.max_items}}"
+              - name: settings_name
+                value: "{{inputs.parameters.settings_name}}"
+              - name: groups
+                value: "{{inputs.parameters.groups}}"
+              - name: chunks_per_task
+                value: "{{inputs.parameters.chunks_per_task}}"
+              - name: max_tasks
+                value: "{{inputs.parameters.max_tasks}}"
+              - name: convert_parallelism
+                value: "{{inputs.parameters.convert_parallelism}}"
+              - name: nworkers
+                value: "{{inputs.parameters.nworkers}}"
+              - name: overwrite
+                value: "{{inputs.parameters.overwrite}}"
+              - name: update_stac
+                value: "{{inputs.parameters.update_stac}}"
+              - name: stac_dry_run
+                value: "{{inputs.parameters.stac_dry_run}}"
+              - name: mirror_prefix
+                value: "{{inputs.parameters.mirror_prefix}}"
+              - name: converted_prefix
+                value: "{{inputs.parameters.converted_prefix}}"
+              - name: orbit_image
+                value: "{{inputs.parameters.orbit_image}}"
+
+        - name: mirror
+          depends: check-arguments
+          templateRef:
+            name: cdse-orbit-to-eopf-mirror
+            template: main
+          arguments:
+            parameters:
+              - name: collection
+                value: "{{inputs.parameters.collection}}"
+              - name: reference_item
+                value: "{{inputs.parameters.reference_item}}"
+              - name: platform
+                value: "{{inputs.parameters.platform}}"
+              - name: relative_orbit
+                value: "{{inputs.parameters.relative_orbit}}"
+              - name: absolute_orbit
+                value: "{{inputs.parameters.absolute_orbit}}"
+              - name: datetime
+                value: "{{inputs.parameters.datetime}}"
+              - name: lat_range
+                value: "{{inputs.parameters.lat_range}}"
+              - name: align_level
+                value: "{{inputs.parameters.align_level}}"
+              - name: align_rule
+                value: "{{inputs.parameters.align_rule}}"
+              - name: bbox
+                value: "{{inputs.parameters.bbox}}"
+              - name: region_name
+                value: "{{inputs.parameters.region_name}}"
+              - name: mirror_prefix
+                value: "{{inputs.parameters.mirror_prefix}}"
+              - name: converted_prefix
+                value: "{{inputs.parameters.converted_prefix}}"
+              - name: check_sample_service
+                value: "{{inputs.parameters.check_sample_service}}"
+              - name: max_items
+                value: "{{inputs.parameters.max_items}}"
+              # informational in cdse-orbit-to-eopf-mirror (its DAG is fixed at 4,
+              # the CDSE limit of concurrent connections per account)
+              - name: parallelism
+                value: "4"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: eopf_image
+                value: "{{inputs.parameters.eopf_image}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.healpix_image}}"
+
+        - name: convert
+          depends: mirror
+          templateRef:
+            name: healpix-convert-multistage
+            template: main
+          arguments:
+            parameters:
+              - name: input_paths
+                value: "{{tasks.mirror.outputs.parameters.mirror_paths}}"
+              - name: output_path
+                value: "{{tasks.mirror.outputs.parameters.healpix_output_path}}"
+              # band region (GeoJSON Polygon, "" = no clipping) and how it was built
+              - name: output_extent
+                value: "{{tasks.mirror.outputs.parameters.output_extent}}"
+              - name: extent_info
+                value: "{{tasks.mirror.outputs.parameters.extent_info}}"
+              - name: settings_name
+                value: "{{tasks.check-arguments.outputs.parameters.settings_name}}"
+              - name: groups
+                value: "{{inputs.parameters.groups}}"
+              - name: chunks_per_task
+                value: "{{inputs.parameters.chunks_per_task}}"
+              - name: max_tasks
+                value: "{{inputs.parameters.max_tasks}}"
+              - name: parallelism
+                value: "{{inputs.parameters.convert_parallelism}}"
+              - name: overwrite
+                value: "{{inputs.parameters.overwrite}}"
+              - name: nworkers
+                value: "{{inputs.parameters.nworkers}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: healpix_image
+                value: "{{inputs.parameters.orbit_image}}"
+
+        # only the two categories of this collection are re-indexed:
+        # eopf-mirror/<g4e collection>,converted/<g4e collection>, with the G4E
+        # collection id taken from the query's orbit output (bucket_prefix keeps
+        # the stac-scraper-update default s3://grid4earth/public; check-arguments
+        # checks that mirror_prefix / converted_prefix are these categories)
+        - name: update-stac
+          depends: convert
+          when: "{{inputs.parameters.update_stac}} == true"
+          templateRef:
+            name: stac-scraper-update
+            template: main
+          arguments:
+            parameters:
+              - name: include_categories
+                value: "eopf-mirror/{{=jsonpath(tasks.mirror.outputs.parameters.orbit, '$.g4e_collection')}},converted/{{=jsonpath(tasks.mirror.outputs.parameters.orbit, '$.g4e_collection')}}"
+              - name: dry_run
+                value: "{{inputs.parameters.stac_dry_run}}"
+              - name: s3_endpoint
+                value: "{{inputs.parameters.s3_endpoint}}"
+              - name: orbit_image
+                value: "{{inputs.parameters.orbit_image}}"
+
+  - name: check-arguments
+    inputs:
+      parameters:
+        - name: collection
+        - name: reference_item
+        - name: platform
+        - name: relative_orbit
+        - name: absolute_orbit
+        - name: datetime
+        - name: lat_range
+        - name: align_level
+        - name: align_rule
+        - name: bbox
+        - name: region_name
+        - name: check_sample_service
+        - name: max_items
+        - name: settings_name
+        - name: groups
+        - name: chunks_per_task
+        - name: max_tasks
+        - name: convert_parallelism
+        - name: nworkers
+        - name: overwrite
+        - name: update_stac
+        - name: stac_dry_run
+        - name: mirror_prefix
+        - name: converted_prefix
+        - name: orbit_image
+    outputs:
+      parameters:
+        - name: settings_name
+          valueFrom:
+            path: /tmp/out/settings_name
+        - name: g4e_collection
+          valueFrom:
+            path: /tmp/out/g4e_collection
+    # also bounds a pod stuck in Pending: an orbit_image that was not pushed
+    # (ImagePullBackOff) or a node that cannot start it fails the run here
+    activeDeadlineSeconds: 900
+    volumes:
+      # optional: their absence is reported by the script instead of blocking the pod
+      - name: s3-creds
+        secret:
+          secretName: argo-s3-credentials
+          optional: true
+      - name: cdse-creds
+        secret:
+          secretName: argo-cdse-credentials
+          optional: true
+    script:
+      image: "{{inputs.parameters.orbit_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        limits:
+          cpu: "1"
+          memory: 2Gi
+        requests:
+          cpu: 100m
+          memory: 512Mi
+      volumeMounts:
+        - name: s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+        - name: cdse-creds
+          readOnly: true
+          mountPath: /etc/cdse
+      source: |
+        """Check the pipeline arguments and prerequisites before anything is downloaded or written."""
+        collection = "{{inputs.parameters.collection}}"
+        reference_item = "{{inputs.parameters.reference_item}}"
+        platform = "{{inputs.parameters.platform}}"
+        relative_orbit = "{{inputs.parameters.relative_orbit}}"
+        absolute_orbit = "{{inputs.parameters.absolute_orbit}}"
+        datetime_range = "{{inputs.parameters.datetime}}"
+        lat_range = "{{inputs.parameters.lat_range}}"
+        align_level = "{{inputs.parameters.align_level}}"
+        align_rule = "{{inputs.parameters.align_rule}}"
+        bbox = "{{inputs.parameters.bbox}}"
+        region_name = "{{inputs.parameters.region_name}}"
+        check_sample_service = "{{inputs.parameters.check_sample_service}}"
+        max_items = "{{inputs.parameters.max_items}}"
+        settings_name = r'''{{inputs.parameters.settings_name}}'''
+        groups = r'''{{inputs.parameters.groups}}'''
+        chunks_per_task = "{{inputs.parameters.chunks_per_task}}"
+        max_tasks = "{{inputs.parameters.max_tasks}}"
+        convert_parallelism = "{{inputs.parameters.convert_parallelism}}"
+        nworkers = "{{inputs.parameters.nworkers}}"
+        overwrite = "{{inputs.parameters.overwrite}}"
+        update_stac = "{{inputs.parameters.update_stac}}"
+        stac_dry_run = "{{inputs.parameters.stac_dry_run}}"
+        mirror_prefix = "{{inputs.parameters.mirror_prefix}}"
+        converted_prefix = "{{inputs.parameters.converted_prefix}}"
+
+        import importlib
+        import json
+        import os
+        import re
+        import sys
+
+        OUT_DIR = "/tmp/out"
+        S3_CREDS_DIR = "/etc/s3"
+        CDSE_CREDS_DIR = "/etc/cdse"
+        # stac-scraper repository checkout in orbit_image (asset/collection templates)
+        SCRAPER_DIR = "/opt/stac-scraper"
+        # bucket_prefix of stac-scraper-update (its default); update-stac re-indexes
+        # <STAC_BUCKET_PREFIX>/eopf-mirror/<g4e collection> and .../converted/<g4e collection>
+        STAC_BUCKET_PREFIX = "s3://grid4earth/public"
+        STAC_GROUPS = (("mirror_prefix", "eopf-mirror"), ("converted_prefix", "converted"))
+        BBOX_PRESETS = ("france",)
+        # band mode, same rules as cdse-orbit-to-eopf-mirror (query)
+        LAT_RANGE_PRESETS = ("france",)
+        LAT_RANGE_OFF = ("", "none")  # bbox mode
+        MAX_ALIGN_LEVEL = 11
+        ALIGN_RULES = ("intersects", "within")
+        # CDSE collection id -> G4E collection id (= legacy_converters settings name);
+        # same table as cdse-orbit-to-eopf-mirror (query)
+        G4E_COLLECTIONS = {
+            "sentinel-2-l1c": "sentinel-2-l1c",
+            "sentinel-2-l2a": "sentinel-2-l2a",
+            "sentinel-3-olci-1-efr-ntc": "sentinel-3-olci-l1-efr",
+            "sentinel-3-olci-1-err-ntc": "sentinel-3-olci-l1-err",
+            "sentinel-3-olci-2-lfr-ntc": "sentinel-3-olci-l2-lfr",
+            "sentinel-3-olci-2-lrr-ntc": "sentinel-3-olci-l2-lrr",
+            "sentinel-3-sl-1-rbt-ntc": "sentinel-3-slstr-l1-rbt",
+            "sentinel-3-sl-2-frp-ntc": "sentinel-3-slstr-l2-frp",
+            "sentinel-3-sl-2-lst-ntc": "sentinel-3-slstr-l2-lst",
+        }
+
+
+        def check_int(errors, name, value, minimum=None, optional=False):
+            text = value.strip()
+            if not text and optional:
+                return
+            try:
+                number = int(text)
+            except ValueError:
+                errors.append(f"{name} must be an integer, got {value!r}")
+                return
+            if minimum is not None and number < minimum:
+                errors.append(f"{name} must be >= {minimum}, got {value!r}")
+
+
+        def check_bbox(errors, value):
+            text = value.strip()
+            if not text or text.lower() in BBOX_PRESETS:
+                return
+            try:
+                minx, miny, maxx, maxy = (float(v) for v in text.split(","))
+            except ValueError:
+                errors.append(f"bbox must be minx,miny,maxx,maxy or one of {list(BBOX_PRESETS)}, got {value!r}")
+                return
+            if not (-180 <= minx < maxx <= 180 and -90 <= miny < maxy <= 90):
+                errors.append(f"bbox needs -180 <= minx < maxx <= 180 and -90 <= miny < maxy <= 90, got {value!r}")
+
+
+        def check_lat_range(errors, value):
+            text = value.strip()
+            if text.lower() in LAT_RANGE_OFF or text.lower() in LAT_RANGE_PRESETS:
+                return
+            try:
+                lat_min, lat_max = (float(v) for v in text.split(","))
+            except ValueError:
+                errors.append(f"lat_range must be min,max, one of {list(LAT_RANGE_PRESETS)} or empty / "
+                              f"'none' (bbox mode), got {value!r}")
+                return
+            if not -90 <= lat_min < lat_max <= 90:
+                errors.append(f"lat_range needs -90 <= min < max <= 90, got {value!r}")
+
+
+        def check_align_level(errors, value):
+            """align_level as an int, None when invalid."""
+            try:
+                level = int(value.strip())
+            except ValueError:
+                level = None
+            if level is None or not 0 <= level <= MAX_ALIGN_LEVEL:
+                errors.append(f"align_level must be an integer in [0, {MAX_ALIGN_LEVEL}], got {value!r}")
+                return None
+            return level
+
+
+        def chunk_levels(settings_obj):
+            """HEALPix levels of the output chunks of the conversion settings."""
+            levels = set()
+            for group in (getattr(settings_obj, "group_settings", None) or {}).values():
+                healpix = getattr(getattr(group, "chunk", None), "healpix", None)
+                level = getattr(healpix, "refinement_level", None)
+                if isinstance(level, int):
+                    levels.add(level)
+            return levels
+
+
+        def check_groups(errors, value):
+            text = value.strip()
+            if not text:
+                return
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, str) and parsed:
+                return
+            if not (isinstance(parsed, list) and parsed and all(isinstance(g, str) and g.strip("/") for g in parsed)):
+                errors.append(f"groups must be empty, a JSON list of group paths or a JSON string pattern, got {value!r}")
+
+
+        def check_settings(errors, settings):
+            """Resolve settings_name with the converter installed in orbit_image (None if it cannot)."""
+            try:
+                try:
+                    from healpix_convert import ConvertSettings
+                except ImportError:
+                    from legacy_converters import ConvertSettings
+                from legacy_converters import get_settings
+            except ImportError as exc:
+                print(f"note: no converter in this image ({exc}); settings_name not resolved")
+                return None
+            try:
+                if settings.startswith("{"):
+                    return ConvertSettings.model_validate_json(settings)
+                return get_settings(settings)
+            except Exception as exc:
+                errors.append(f"settings_name {settings[:80]!r} does not resolve: {type(exc).__name__}: {exc}")
+                return None
+
+
+        def check_secret(errors, directory, keys, secret):
+            missing = [k for k in keys if not os.path.isfile(os.path.join(directory, k))]
+            if missing:
+                errors.append(f"secret {secret} is missing (keys {', '.join(missing)}): create it in the argo namespace")
+
+
+        def check(errors):
+            g4e_collection = G4E_COLLECTIONS.get(collection.strip())
+            if g4e_collection is None:
+                errors.append(f"unsupported collection {collection!r}; known: {sorted(G4E_COLLECTIONS)}")
+
+            settings = settings_name.strip()
+            if not settings:
+                settings = g4e_collection or ""
+                print(f"settings_name: empty, using {settings!r}")
+            elif settings.startswith("{"):
+                print("settings_name: inline ConvertSettings JSON")
+            elif g4e_collection is not None:
+                allowed = [g4e_collection]
+                if g4e_collection.startswith("sentinel-3"):  # PSF variants exist for S3 only
+                    allowed.append(f"{g4e_collection}-psf")
+                if settings not in allowed:
+                    errors.append(
+                        f"settings_name {settings!r} does not match collection {collection!r}: "
+                        f"use {' or '.join(repr(a) for a in allowed)}, or leave it empty"
+                    )
+            settings_obj = check_settings(errors, settings) if settings else None
+
+            manual = [name for name, value in (
+                ("platform", platform), ("relative_orbit", relative_orbit),
+                ("absolute_orbit", absolute_orbit), ("datetime", datetime_range),
+            ) if value.strip()]
+            if reference_item.strip() and manual:
+                errors.append(f"reference_item sets the orbit; leave {', '.join(manual)} empty")
+            if not reference_item.strip() and not datetime_range.strip():
+                errors.append("give reference_item, or datetime (+ platform / relative_orbit / absolute_orbit)")
+            check_int(errors, "relative_orbit", relative_orbit, 1, optional=True)
+            check_int(errors, "absolute_orbit", absolute_orbit, 1, optional=True)
+            check_int(errors, "max_items", max_items, 1, optional=True)
+            check_bbox(errors, bbox)
+            check_lat_range(errors, lat_range)
+            level = check_align_level(errors, align_level)
+            if align_rule.strip().lower() not in ALIGN_RULES:
+                errors.append(f"align_rule must be one of {list(ALIGN_RULES)}, got {align_rule!r}")
+            if lat_range.strip().lower() not in LAT_RANGE_OFF and level is not None and settings_obj is not None:
+                # healpix-convert clips output_extent per chunk: with chunks larger than
+                # the align_level cells the output would not follow the cells
+                levels = chunk_levels(settings_obj)
+                if levels and level > min(levels):
+                    errors.append(
+                        f"align_level {level} is above the chunk level {min(levels)} of settings "
+                        f"{settings[:80]!r}: the output is clipped per chunk; use align_level <= {min(levels)}"
+                    )
+            if region_name.strip() and not re.fullmatch(r"[A-Za-z0-9-]+", region_name.strip()):
+                errors.append(f"region_name may only contain letters, digits and '-', got {region_name!r}")
+
+            check_groups(errors, groups)
+            for name, value in (("chunks_per_task", chunks_per_task), ("max_tasks", max_tasks),
+                                ("convert_parallelism", convert_parallelism), ("nworkers", nworkers)):
+                check_int(errors, name, value, 1)
+            if nworkers.strip() not in ("", "1") and not any(m.startswith("nworkers ") for m in errors):
+                print(f"note: nworkers={nworkers.strip()} on conversion pods with 1 CPU: the workers share it "
+                      "(raise the convert-chunk resources of healpix-convert-multistage first)")
+            for name, value in (("check_sample_service", check_sample_service), ("overwrite", overwrite),
+                                ("update_stac", update_stac), ("stac_dry_run", stac_dry_run)):
+                if value not in ("true", "false"):
+                    errors.append(f"{name} must be 'true' or 'false', got {value!r}")
+
+            check_secret(errors, S3_CREDS_DIR, ("accessKey", "secretKey"), "argo-s3-credentials")
+            check_secret(errors, CDSE_CREDS_DIR, ("username", "password"), "argo-cdse-credentials")
+
+            if update_stac == "true":
+                prefixes = {"mirror_prefix": mirror_prefix, "converted_prefix": converted_prefix}
+                for name, group in STAC_GROUPS:
+                    expected = f"{STAC_BUCKET_PREFIX}/{group}"
+                    if prefixes[name].strip().rstrip("/") != expected:
+                        errors.append(
+                            f"update_stac=true re-indexes {group}/<collection> under {STAC_BUCKET_PREFIX} "
+                            f"only: {name} must be {expected}, got {prefixes[name]!r}; "
+                            "set update_stac=false for another prefix"
+                        )
+                try:
+                    importlib.import_module("stac_scraper.cli")
+                    ok = all(os.path.isdir(os.path.join(SCRAPER_DIR, d)) for d in ("assets", "collections"))
+                except ImportError:
+                    ok = False
+                if not ok:
+                    errors.append(f"update_stac=true needs stac-scraper and its checkout in {SCRAPER_DIR} "
+                                  "(the orbit image); set update_stac=false with another orbit_image")
+                elif g4e_collection and not os.path.isfile(
+                        os.path.join(SCRAPER_DIR, "collections", f"{g4e_collection}.yaml")):
+                    # stac-scraper-update stops (exit 2) on a target without a template,
+                    # i.e. only after the whole conversion: fail here instead
+                    errors.append(f"stac-scraper has no collection template collections/{g4e_collection}.yaml, "
+                                  "so the STAC update would stop after the conversion: set update_stac=false")
+            return g4e_collection or "", settings
+
+
+        def main():
+            errors = []
+            g4e_collection, settings = check(errors)
+            if errors:
+                for message in errors:
+                    print(f"ERROR: {message}", file=sys.stderr)
+                sys.exit(1)
+            print(f"collection {collection} -> {g4e_collection}, settings {settings[:80]!r}")
+            os.makedirs(OUT_DIR, exist_ok=True)
+            with open(os.path.join(OUT_DIR, "settings_name"), "w") as f:
+                f.write(settings)
+            with open(os.path.join(OUT_DIR, "g4e_collection"), "w") as f:
+                f.write(g4e_collection)
+
+
+        if __name__ == "__main__":
+            main()

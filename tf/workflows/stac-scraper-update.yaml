@@ -1,0 +1,1019 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: stac-scraper-update
+  namespace: argo
+spec:
+  # Refreshes the public STAC index (per-collection stac-geoparquet files and
+  # collections.json under bucket_prefix) with stac-scraper, for the categories
+  # listed in include_categories only.
+  #
+  # include_categories is a comma-separated list of exact "group/category" paths
+  # under bucket_prefix, e.g. eopf-mirror/sentinel-2-l2a,converted/sentinel-2-l2a.
+  # An entry may also be a URL under bucket_prefix of a category or of a dataset
+  # in it (e.g. s3://grid4earth/public/converted/sentinel-2-l2a/<name>.zarr):
+  # its group/category is used. Every other "group/category" path found under
+  # bucket_prefix, and every group without a target (tmp, healpix-resample-paper,
+  # auxiliary, reprocessed, ...), is passed to stac-scraper --exclude-categories
+  # (exact matches), so nothing else is scraped. A bare group ("converted") is
+  # refused: re-scraping a whole group would also publish its other, unchecked
+  # categories. A target that does not exist or holds no dataset is skipped with
+  # a warning.
+  #
+  # exclude_stores (comma-separated store paths relative to bucket_prefix, or URLs
+  # under it) leaves stores out of the index while they stay in the bucket, e.g. the
+  # second copy of a product. KNOWN_EXCLUDED_STORES (in the script) is always added:
+  # eopf-mirror/sentinel-3-olci-l1-efr holds the same OLCI product twice (..._004.SEN3.zarr
+  # and ..._004.zarr, same stac_discovery id); both copies stay in the bucket and only
+  # the .SEN3.zarr one is catalogued (decision of 2026-10-09). stac-scraper is given
+  # --exclude-stores when its version has it (stac-scraper PR #24); otherwise (62b5c01)
+  # the items of these stores are removed from the scraped parquet files before the
+  # checks below.
+  #
+  # Publishing (dry_run=true uploads nothing and prints what would be uploaded):
+  #   1. only the parquet files of the targets (<group>_-_<category>.parquet) are
+  #      uploaded;
+  #   2. collections.json is MERGED: the published collections.json is read, the
+  #      collections of the targets (stac-scraper copy-collections on the scraped
+  #      parquet files, e.g. mirror-sentinel-2-l2a and converted-sentinel-2-l2a)
+  #      replace the entry with the same id in place or are appended, and every
+  #      other entry is kept as is and in order: nothing is ever removed. A diff
+  #      summary (added / replaced / kept) is printed. It is uploaded last, and
+  #      only if the published file did not change during the run (otherwise the
+  #      attempt fails and the retry merges again).
+  #
+  # Checks that stop the run before anything is uploaded (exit code 2, not
+  # retried):
+  #   - a target dataset directory without a root zarr.json (an interrupted
+  #     upload; stac-scraper fails on it): delete it or re-run the step that
+  #     writes it;
+  #   - a failed stac-scraper scrape-items whose cause is in the target datasets
+  #     (read again after the failure): an invalid zarr.json or stac_discovery, a
+  #     category without any published item (uploads in progress only), a field
+  #     that is an object in one item and not in another (the geoparquet writer
+  #     needs one type per field) or an empty object in every item (parquet has
+  #     no empty struct), e.g. the processing:expression object of healpix-convert;
+  #   - duplicated item ids in a target parquet file (the STAC API answers 404 for
+  #     them): the ids and their stores are printed; add one store of each pair to
+  #     exclude_stores (or give it a distinct stac_discovery id) and re-run;
+  #   - a target without a stac-scraper collection template, or whose collection
+  #     id is published for another parquet file;
+  #   - an invalid include_categories, exclude_stores, dry_run (true or false only)
+  #     or published collections.json, an orbit_image without stac-scraper.
+  # Other failures (network, S3) are retried by the retryStrategy.
+  #
+  # A mutex keeps two runs from publishing at the same time. The stac-index
+  # artifact (target parquet files, the merged collections.json, and for
+  # inspection collections.live.json / collections.generated.json) is stored at an
+  # explicit S3 location (s3://g4e-desp-argo-artifacts/stac-scraper-update/<workflow
+  # uid>/), so the template does not depend on the default artifact repository of
+  # the controller.
+  #
+  # The "main" template is self-contained (template-level volumes) so other
+  # workflows can call it with
+  #   templateRef: {name: stac-scraper-update, template: main}
+  entrypoint: main
+  serviceAccountName: argo-workflow
+  imagePullSecrets:
+    - name: harbor-pull-secret
+  arguments:
+    parameters:
+      - name: include_categories
+        value: eopf-mirror/sentinel-2-l2a,converted/sentinel-2-l2a
+        description: comma-separated exact group/category paths under bucket_prefix to re-index (or URLs of categories / datasets under bucket_prefix)
+      - name: bucket_prefix
+        value: s3://grid4earth/public
+      - name: exclude_stores
+        value: ""
+        description: comma-separated store paths relative to bucket_prefix (or URLs) left out of the index, e.g. the second copy of a product; they stay in the bucket
+      - name: dry_run
+        value: "false"
+        enum: ["true", "false"]
+        description: build the index and print the uploads and the collections.json diff without uploading
+      - name: s3_endpoint
+        value: https://s3.gra.io.cloud.ovh.net
+      - name: orbit_image
+        value: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-10-orbit
+  templates:
+  - name: main
+    inputs:
+      parameters:
+        - name: include_categories
+          default: eopf-mirror/sentinel-2-l2a,converted/sentinel-2-l2a
+        - name: bucket_prefix
+          default: s3://grid4earth/public
+        - name: exclude_stores
+          default: ""
+        - name: dry_run
+          default: "false"
+          enum: ["true", "false"]
+        - name: s3_endpoint
+          default: https://s3.gra.io.cloud.ovh.net
+        - name: orbit_image
+          default: y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-private:2026-10-10-orbit
+    outputs:
+      artifacts:
+        # the generated index, also kept for dry runs so it can be inspected
+        # before publishing
+        - name: stac-index
+          path: /work/stac
+          optional: true
+          s3:
+            endpoint: s3.gra.io.cloud.ovh.net
+            region: gra
+            insecure: false
+            bucket: g4e-desp-argo-artifacts
+            key: "stac-scraper-update/{{workflow.uid}}/stac-index.tgz"
+            accessKeySecret:
+              name: argo-s3-credentials
+              key: accessKey
+            secretKeySecret:
+              name: argo-s3-credentials
+              key: secretKey
+    synchronization:
+      mutexes:
+        - name: stac-scraper-update
+    retryStrategy:
+      limit: "3"
+      retryPolicy: Always
+      # exit code 2 = invalid arguments, broken or duplicated items, collection
+      # conflicts: retrying cannot help. Every attempt starts from scratch and
+      # uploads the same files, so a retry after a partial upload is safe.
+      expression: 'lastRetry.exitCode != "2"'
+      backoff:
+        duration: "1m"
+        factor: "2"
+    # per attempt; also bounds a pod stuck in Pending (ImagePullBackOff)
+    activeDeadlineSeconds: 7200
+    volumes:
+      - name: stac-scraper-s3-creds
+        secret:
+          secretName: argo-s3-credentials
+      - name: stac-scraper-work
+        emptyDir: {}
+    script:
+      name: ""
+      image: "{{inputs.parameters.orbit_image}}"
+      command:
+        - python
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        limits:
+          cpu: "2"
+          memory: 4Gi
+        requests:
+          cpu: "1"
+          memory: 2Gi
+      volumeMounts:
+        - name: stac-scraper-s3-creds
+          readOnly: true
+          mountPath: /etc/s3
+        - name: stac-scraper-work
+          mountPath: /work
+      source: |
+        import configparser
+        import json
+        import os
+        import pathlib
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+        from collections import Counter
+        from concurrent.futures import ThreadPoolExecutor
+
+        from fsspec.core import url_to_fs
+
+        include_categories = "{{inputs.parameters.include_categories}}"
+        bucket_prefix = "{{inputs.parameters.bucket_prefix}}"
+        exclude_stores = "{{inputs.parameters.exclude_stores}}"
+        dry_run = "{{inputs.parameters.dry_run}}"
+        s3_endpoint = "{{inputs.parameters.s3_endpoint}}"
+
+        S3_CREDS_DIR = "/etc/s3"
+        WORK_DIR = "/work"
+        # checkout of the stac-scraper repository in the orbit image: the asset
+        # and collection templates (assets/, collections/) live at its root
+        SCRAPER_DIR = "/opt/stac-scraper"
+        AWS_PROFILE = "grid4earth"
+        S3_REGION = "gra"
+        EXIT_INVALID = 2  # deterministic error, not retried by the retryStrategy
+        CLICK_USAGE_ERROR = 2  # exit code of stac-scraper (rich-click) for bad arguments
+        # groups that do not follow the group/category/dataset layout: never scraped
+        ALWAYS_EXCLUDED = ("tmp", "healpix-resample-paper")
+        # stac-scraper writes the items of <group>/<category> to
+        # <group>_-_<category>.parquet (variant_separator in stac_scraper/cli.py)
+        VARIANT_SEPARATOR = "_-_"
+        # asset of the stac-scraper asset template (assets/default.yaml) that points
+        # at the zarr store of an item
+        STORE_ASSET = "product"
+        COLLECTIONS_JSON = "collections.json"
+        # stores left out of the index although they stay in the bucket (always added
+        # to exclude_stores), relative to bucket_prefix. The same OLCI product is
+        # stored twice with the same stac_discovery id: as ..._004.SEN3.zarr (the
+        # safe-to-zarr naming) and as ..._004.zarr. Decision of 2026-10-09: keep both,
+        # catalogue the .SEN3.zarr one.
+        KNOWN_EXCLUDED_STORES = (
+            "eopf-mirror/sentinel-3-olci-l1-efr/S3A_OL_1_EFR____20260115T101700_20260115T102000"
+            "_20260116T111727_0179_135_065_2160_PS1_O_NT_004.zarr",
+        )
+        MAX_REPORTED = 50  # problems printed when scrape-items fails
+        # slow or unstable links: long timeouts and adaptive retries
+        S3_CONNECT_TIMEOUT = 120
+        S3_READ_TIMEOUT = 600
+        S3_MAX_ATTEMPTS = 10
+        S3_RETRY_MODE = "adaptive"
+        # the same timeouts for the obstore client of stac-scraper, which reads
+        # them from the environment (object_store client options)
+        SCRAPER_CLIENT_ENV = {
+            "AWS_CONNECT_TIMEOUT": f"{S3_CONNECT_TIMEOUT}s",
+            "AWS_TIMEOUT": f"{S3_READ_TIMEOUT}s",
+        }
+        CONTENT_TYPES = {
+            ".parquet": "application/vnd.apache.parquet",
+            ".json": "application/json",
+        }
+
+
+        def fail(message, code=EXIT_INVALID):
+            print(f"ERROR: {message}", flush=True)
+            sys.exit(code)
+
+
+        def read_s3_credentials():
+            creds_dir = pathlib.Path(S3_CREDS_DIR)
+            access_key = (creds_dir / "accessKey").read_text().strip()
+            secret_key = (creds_dir / "secretKey").read_text().strip()
+            return access_key, secret_key
+
+
+        def s3_client_config():
+            """botocore Config arguments (a new dict per client: botocore rewrites
+            the retries dict it is given)."""
+            return {
+                "connect_timeout": S3_CONNECT_TIMEOUT,
+                "read_timeout": S3_READ_TIMEOUT,
+                "retries": {"max_attempts": S3_MAX_ATTEMPTS, "mode": S3_RETRY_MODE},
+            }
+
+
+        def storage_options_for(url):
+            if not url.startswith("s3://"):
+                return {}
+            access_key, secret_key = read_s3_credentials()
+            return {
+                "key": access_key,
+                "secret": secret_key,
+                "client_kwargs": {"endpoint_url": s3_endpoint},
+                "config_kwargs": s3_client_config(),
+                # the index is read anonymously by the STAC API: every object
+                # written by this template must be public-read
+                "s3_additional_kwargs": {"ACL": "public-read"},
+            }
+
+
+        def write_private_file(path, parser):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                parser.write(f)
+
+
+        def scraper_env(home, prefix):
+            """Environment of the stac-scraper subprocesses.
+
+            For s3:// prefixes, the "grid4earth" AWS profile is written into a
+            private temporary HOME (removed at the end of the run).
+            """
+            env = dict(os.environ)
+            for name in (
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_PROFILE",
+                "AWS_DEFAULT_PROFILE",
+            ):
+                env.pop(name, None)
+            env["HOME"] = str(home)
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            if prefix.startswith("s3://"):
+                access_key, secret_key = read_s3_credentials()
+                aws_dir = home / ".aws"
+                aws_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                config = configparser.RawConfigParser()
+                config[f"profile {AWS_PROFILE}"] = {
+                    "region": S3_REGION,
+                    "endpoint_url": s3_endpoint,
+                    "retry_mode": S3_RETRY_MODE,
+                    "max_attempts": str(S3_MAX_ATTEMPTS),
+                }
+                credentials = configparser.RawConfigParser()
+                credentials[AWS_PROFILE] = {
+                    "aws_access_key_id": access_key,
+                    "aws_secret_access_key": secret_key,
+                }
+                write_private_file(aws_dir / "config", config)
+                write_private_file(aws_dir / "credentials", credentials)
+                env["AWS_CONFIG_FILE"] = str(aws_dir / "config")
+                env["AWS_SHARED_CREDENTIALS_FILE"] = str(aws_dir / "credentials")
+                env["AWS_REGION"] = S3_REGION
+                env["AWS_DEFAULT_REGION"] = S3_REGION
+                env["AWS_EC2_METADATA_DISABLED"] = "true"
+                env.update(SCRAPER_CLIENT_ENV)
+            return env
+
+
+        def check_scraper():
+            """stac-scraper and its templates are in the image (an image without
+            them fails the same way on every attempt)."""
+            root = pathlib.Path(SCRAPER_DIR)
+            missing = [
+                name
+                for name in ("stac_scraper/__main__.py", "assets", "collections")
+                if not (root / name).exists()
+            ]
+            if missing:
+                fail(
+                    f"{SCRAPER_DIR} has no {', '.join(missing)}: orbit_image must contain "
+                    "a stac-scraper checkout"
+                )
+
+
+        def run_scraper(args, env):
+            print("+ stac-scraper " + " ".join(args), flush=True)
+            result = subprocess.run(
+                [sys.executable, "-m", "stac_scraper", *args], cwd=SCRAPER_DIR, env=env
+            )
+            if result.returncode == CLICK_USAGE_ERROR:
+                fail(f"stac-scraper {args[0]} refused its arguments")
+            if result.returncode:
+                raise subprocess.CalledProcessError(result.returncode, ["stac-scraper", *args])
+
+
+        def list_entries(fs, root, kind):
+            fs.invalidate_cache()
+            try:
+                entries = fs.ls(root, detail=True)
+            except FileNotFoundError:
+                return []
+            return sorted(
+                entry["name"].rstrip("/").rsplit("/", 1)[-1]
+                for entry in entries
+                if entry["type"] == kind
+            )
+
+
+        def read_remote(fs, path):
+            """Content of a remote file, None when it does not exist."""
+            fs.invalidate_cache()
+            try:
+                return fs.cat_file(path)
+            except FileNotFoundError:
+                return None
+
+
+        def parse_targets(value, prefix):
+            """The exact group/category paths of include_categories.
+
+            An entry is a group/category path relative to prefix, or a URL (path)
+            under prefix of a category or of a dataset in it, whose group/category
+            is taken (e.g. s3://grid4earth/public/converted/sentinel-2-l2a/X.zarr ->
+            converted/sentinel-2-l2a).
+            """
+            targets = []
+            for entry in value.split(","):
+                entry = entry.strip()
+                if not entry.strip("/"):
+                    continue
+                is_url = "://" in entry or entry.startswith("/")
+                relative = entry
+                if is_url:
+                    if not entry.startswith(prefix + "/"):
+                        fail(f"include_categories: {entry!r} is not under {prefix}")
+                    relative = entry[len(prefix) :]
+                parts = [part for part in relative.split("/") if part]
+                if any(part in (".", "..") for part in parts):
+                    fail(f"include_categories: {entry!r} is not a group/category path")
+                if len(parts) < 2:
+                    fail(
+                        f"include_categories: {entry!r} is a whole group, not a group/category "
+                        "path (e.g. eopf-mirror/sentinel-2-l2a): whole groups are not re-indexed"
+                    )
+                if not is_url and len(parts) != 2:
+                    fail(
+                        f"include_categories: {entry!r} is not a group/category path (e.g. "
+                        "eopf-mirror/sentinel-2-l2a); a dataset of a category is only accepted "
+                        f"as a URL under {prefix} (its category is then indexed)"
+                    )
+                if parts[0] in ALWAYS_EXCLUDED:
+                    fail(
+                        f"include_categories: {entry!r}: the {parts[0]} group is never indexed"
+                    )
+                target = "/".join(parts[:2])
+                if is_url:
+                    print(f"include_categories: {entry} -> {target}")
+                if target not in targets:
+                    targets.append(target)
+            if not targets:
+                fail("include_categories is empty")
+            return targets
+
+
+        def parquet_name(category_path):
+            group, category = category_path.split("/")
+            return f"{group}{VARIANT_SEPARATOR}{category}.parquet"
+
+
+        def parse_stores(value, prefix):
+            """The store paths (relative to prefix) of exclude_stores: an entry is a
+            group/category/.../<store> path relative to prefix or a URL under prefix."""
+            stores = []
+            for entry in value.split(","):
+                entry = entry.strip()
+                if not entry.strip("/"):
+                    continue
+                relative = entry
+                if "://" in entry or entry.startswith("/"):
+                    if not entry.startswith(prefix + "/"):
+                        fail(f"exclude_stores: {entry!r} is not under {prefix}")
+                    relative = entry[len(prefix) :]
+                parts = [part for part in relative.split("/") if part]
+                if len(parts) < 3 or any(part in (".", "..") for part in parts):
+                    fail(
+                        f"exclude_stores: {entry!r} is not a store path "
+                        f"<group>/<category>/<store> (relative to {prefix}, or a URL under it)"
+                    )
+                path = "/".join(parts)
+                if path not in stores:
+                    stores.append(path)
+            return stores
+
+
+        def scraper_has_option(option):
+            """True when the stac-scraper checkout of the image knows a CLI option."""
+            try:
+                return option in (pathlib.Path(SCRAPER_DIR) / "stac_scraper" / "cli.py").read_text()
+            except OSError:
+                return False
+
+
+        def is_excluded(href, stores):
+            href = href.rstrip("/")
+            return any(href == store or href.endswith("/" + store) for store in stores)
+
+
+        def drop_excluded_items(path, stores):
+            """Remove the items whose zarr store is one of stores from a stac-geoparquet
+            file (when stac-scraper cannot skip them itself). Returns the number removed."""
+            try:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+            except ImportError:
+                fail(
+                    "exclude_stores needs pyarrow, or a stac-scraper with --exclude-stores, "
+                    "in orbit_image"
+                )
+            parquet = pq.ParquetFile(path)
+            # the geoparquet metadata ("geo", "stac-geoparquet") of the file written by
+            # stac-scraper (parquet-rs): read_table does not carry it, readers need it
+            file_metadata = {
+                key: value
+                for key, value in (parquet.metadata.metadata or {}).items()
+                if key != b"ARROW:schema"
+            }
+            table = parquet.read()
+            if "assets" not in table.column_names:
+                return 0
+            keep = [
+                not any(is_excluded(href, stores) for href in store_hrefs(assets))
+                for assets in table.column("assets").to_pylist()
+            ]
+            removed = keep.count(False)
+            if removed:
+                kept = table.filter(pa.array(keep))
+                kept = kept.replace_schema_metadata({**(kept.schema.metadata or {}), **file_metadata})
+                pq.write_table(kept, path)
+            return removed
+
+
+        def list_datasets(fs, root, categories):
+            """Dataset directories <group>/<category>/<dataset> of every category,
+            and those without a root zarr.json: stac-scraper fails on them (it only
+            skips a zarr.json without stac_discovery, e.g. a dataset still being
+            written)."""
+            datasets = {
+                category: [
+                    f"{category}/{name}"
+                    for name in list_entries(fs, f"{root}/{category}", "directory")
+                ]
+                for category in categories
+            }
+            candidates = [path for paths in datasets.values() for path in paths]
+            with ThreadPoolExecutor(16) as pool:
+                found = list(
+                    pool.map(lambda path: fs.exists(f"{root}/{path}/zarr.json"), candidates)
+                )
+            broken = [path for path, ok in zip(candidates, found) if not ok]
+            return datasets, broken
+
+
+        def store_hrefs(assets):
+            """hrefs of the zarr store of an item (STORE_ASSET and its alternates)."""
+            assets = {name: asset for name, asset in (assets or {}).items() if asset}
+            selected = (
+                [assets[STORE_ASSET]] if STORE_ASSET in assets else list(assets.values())[:3]
+            )
+            hrefs = []
+            for asset in selected:
+                hrefs.append(asset.get("href"))
+                for alternate in (asset.get("alternate") or {}).values():
+                    if alternate:
+                        hrefs.append(alternate.get("href"))
+            return [href for href in hrefs if href]
+
+
+        def read_parquet_items(path):
+            """(id, store hrefs) of every item of a stac-geoparquet file."""
+            try:
+                import pyarrow.parquet as pq
+            except ImportError:
+                pq = None
+            if pq is not None:
+                names = pq.ParquetFile(path).schema_arrow.names
+                columns = [name for name in ("id", "assets") if name in names]
+                rows = pq.read_table(path, columns=columns).to_pylist()
+            else:
+                import rustac
+
+                rows = rustac.read_sync(str(path))["features"]
+            return [(row["id"], store_hrefs(row.get("assets"))) for row in rows]
+
+
+        def report_duplicates(name, category, items):
+            """Print the duplicated item ids of one parquet file and their stores."""
+            counts = Counter(item_id for item_id, _ in items)
+            duplicated = sorted(item_id for item_id, n in counts.items() if n > 1)
+            if not duplicated:
+                return False
+            print(
+                f"ERROR: {name} ({category}): {len(duplicated)} duplicated item id(s) "
+                f"among {len(items)} items; the STAC API cannot serve them:"
+            )
+            for item_id in duplicated:
+                print(f"  {item_id} ({counts[item_id]} items):")
+                for other_id, hrefs in items:
+                    if other_id == item_id:
+                        print("    " + (" | ".join(hrefs) or "(no asset href)"))
+            return True
+
+
+        def json_kind(value):
+            if isinstance(value, dict):
+                return "object"
+            if isinstance(value, list):
+                return "array"
+            if isinstance(value, str):
+                return "string"
+            return "boolean" if isinstance(value, bool) else "number"
+
+
+        def collect_kinds(value, path, dataset, kinds, filled):
+            """JSON kind of every path of an item, with the first dataset where each
+            (path, kind) was seen (null is ignored), and the object paths that have
+            at least one key in some item (filled)."""
+            if value is None:
+                return
+            kinds.setdefault(path, {}).setdefault(json_kind(value), dataset)
+            if isinstance(value, dict):
+                if value:
+                    filled.add(path)
+                for key, child in value.items():
+                    child_path = f"{path}.{key}" if path else key
+                    collect_kinds(child, child_path, dataset, kinds, filled)
+            elif isinstance(value, list):
+                for child in value:
+                    collect_kinds(child, f"{path}[]", dataset, kinds, filled)
+
+
+        def read_dataset_item(fs, root, path):
+            """(path, problem, stac_discovery item) of one dataset, as stac-scraper
+            sees it: no problem and no item = skipped (no root stac_discovery, e.g. a
+            dataset still being written)."""
+            try:
+                document = json.loads(fs.cat_file(f"{root}/{path}/zarr.json"))
+            except FileNotFoundError:
+                return path, "no root zarr.json", None
+            except ValueError as error:
+                return path, f"invalid zarr.json ({error})", None
+            if not isinstance(document, dict):
+                return path, "zarr.json is not a JSON object", None
+            attributes = document.get("attributes")
+            if not isinstance(attributes, dict) or "stac_discovery" not in attributes:
+                return path, None, None
+            item = attributes["stac_discovery"]
+            if not (
+                isinstance(item, dict)
+                and isinstance(item.get("id"), str)
+                and isinstance(item.get("properties"), dict)
+                and isinstance(item.get("stac_extensions"), list)
+            ):
+                return path, "stac_discovery without id, properties or stac_extensions", None
+            return path, None, item
+
+
+        def diagnose_scrape(fs, root, datasets):
+            """Deterministic causes of a scrape-items failure in the target datasets
+            (only called after a failure: it reads every root zarr.json again)."""
+            problems = []
+            with ThreadPoolExecutor(16) as pool:
+                for category, paths in datasets.items():
+                    # stac-scraper adds the assets and storage schemes of its asset
+                    # template to every item: never empty
+                    kinds, filled, indexable = {}, {"assets", "properties.storage:schemes"}, 0
+                    for path, problem, item in pool.map(
+                        lambda path: read_dataset_item(fs, root, path), paths
+                    ):
+                        if problem:
+                            problems.append(f"{path}: {problem}")
+                        elif item is not None:
+                            indexable += 1
+                            for key in ("geometry", "bbox"):
+                                item.pop(key, None)
+                            collect_kinds(item, "", path, kinds, filled)
+                    if not indexable:
+                        problems.append(
+                            f"{category}: no dataset with a root stac_discovery (uploads in "
+                            "progress only?): stac-scraper cannot write an empty collection"
+                        )
+                    # the geoparquet writer infers one arrow type per field: an object
+                    # in one item and a string (number, list) in another is fatal, and
+                    # so is an object that is empty in every item (empty struct)
+                    empty = []
+                    for field, seen in sorted(kinds.items()):
+                        if "object" in seen and len(seen) > 1:
+                            found = [f"{kind} in {where}" for kind, where in seen.items()]
+                            problems.append(f"{category}: {field} is {', '.join(found)}")
+                        elif "object" in seen and field not in filled:
+                            empty.append(f"{field} (in {seen['object']})")
+                    if empty:
+                        problems.append(
+                            f"{category}: {len(empty)} field(s) are an empty object in every "
+                            f"item (parquet cannot store an empty struct): {'; '.join(empty[:3])}"
+                            + (" ..." if len(empty) > 3 else "")
+                        )
+            return problems
+
+
+        def data_href(collection):
+            """parquet file name of a collection (its "data" asset)."""
+            href = ((collection.get("assets") or {}).get("data") or {}).get("href")
+            if not isinstance(href, str):
+                return None
+            return href[2:] if href.startswith("./") else href
+
+
+        def parse_live(content, location):
+            if content is None:
+                print(
+                    f"WARNING: {location} does not exist: the merged collections.json only holds the targets"
+                )
+                return []
+            try:
+                live = json.loads(content)
+            except ValueError as error:
+                fail(f"{location} is not valid JSON ({error}): refusing to merge into it")
+            if not isinstance(live, list) or not all(
+                isinstance(entry, dict) and isinstance(entry.get("id"), str) for entry in live
+            ):
+                fail(
+                    f"{location} is not a list of collections with an id: refusing to merge into it"
+                )
+            repeated = sorted(cid for cid, n in Counter(e["id"] for e in live).items() if n > 1)
+            if repeated:
+                print(
+                    f"WARNING: {location} lists these ids more than once: {', '.join(repeated)}"
+                )
+            return live
+
+
+        def target_collections(generated, expected):
+            """The generated collection of every target parquet file, in target order."""
+            by_parquet = {}
+            for collection in generated:
+                by_parquet.setdefault(data_href(collection), []).append(collection)
+            selected = []
+            for name, category in expected.items():
+                found = by_parquet.get(name, [])
+                if len(found) != 1:
+                    fail(
+                        f"stac-scraper copy-collections made {len(found)} collections for {name} "
+                        f"({category}) instead of 1: is there a collection template "
+                        f"collections/{category.split('/')[1]}.yaml in stac-scraper?"
+                    )
+                selected.append(found[0])
+            repeated = sorted(
+                cid for cid, n in Counter(c.get("id") for c in selected).items() if n > 1
+            )
+            if repeated or not all(isinstance(c.get("id"), str) for c in selected):
+                fail(f"the target collections have missing or repeated ids: {repeated}")
+            return selected
+
+
+        def merge_collections(live, targets, location):
+            """live with the target collections replaced in place (same id) or
+            appended. No live entry is ever removed."""
+            by_id = {collection["id"]: collection for collection in targets}
+            target_ids_by_parquet = {data_href(c): c["id"] for c in targets}
+            merged, replaced, kept, seen = [], [], [], set()
+            for entry in live:
+                collection_id = entry["id"]
+                new = by_id.get(collection_id)
+                if new is None:
+                    merged.append(entry)
+                    kept.append(collection_id)
+                    other = target_ids_by_parquet.get(data_href(entry))
+                    if other is not None:
+                        print(
+                            f"WARNING: {collection_id} of {location} also points at "
+                            f"{data_href(entry)} (now {other}); kept, nothing is removed"
+                        )
+                    continue
+                if data_href(entry) != data_href(new):
+                    fail(
+                        f"{collection_id} of {location} points at {data_href(entry)!r}, not at "
+                        f"{data_href(new)!r}: refusing to replace it"
+                    )
+                merged.append(new)
+                replaced.append((collection_id, entry == new))
+                seen.add(collection_id)
+            added = [c["id"] for c in targets if c["id"] not in seen]
+            merged += [c for c in targets if c["id"] not in seen]
+            merged_ids = {c["id"] for c in merged}
+            lost = [e["id"] for e in live if e["id"] not in merged_ids]
+            if lost or len(merged) < len(live):
+                fail(f"internal error: the merge would drop {lost}", code=1)
+            return merged, added, replaced, kept
+
+
+        def upload(fs, prefix, local_path, remote_path):
+            kwargs = {}
+            if prefix.startswith("s3://"):
+                content_type = CONTENT_TYPES.get(local_path.suffix)
+                if content_type is not None:
+                    kwargs["ContentType"] = content_type
+            else:
+                fs.makedirs(remote_path.rsplit("/", 1)[0], exist_ok=True)
+            fs.put_file(str(local_path), remote_path, **kwargs)
+            print(f"uploaded {local_path.name} -> {remote_path}", flush=True)
+
+
+        def main():
+            prefix = bucket_prefix.strip().rstrip("/")
+            mode = dry_run.strip().lower()
+            if mode not in ("true", "false"):
+                fail(f"dry_run must be 'true' or 'false', got {dry_run!r}")
+            publish = mode == "false"
+            targets = parse_targets(include_categories, prefix)
+            requested_exclusions = parse_stores(exclude_stores, prefix)
+            check_scraper()
+
+            fs, root = url_to_fs(prefix, **storage_options_for(prefix))
+            root = root.rstrip("/")
+
+            # inventory of every group/category under the prefix
+            groups = list_entries(fs, root, "directory")
+            inventory = {
+                group: [
+                    f"{group}/{name}"
+                    for name in list_entries(fs, f"{root}/{group}", "directory")
+                ]
+                for group in groups
+                if group not in ALWAYS_EXCLUDED
+            }
+            present = {path for paths in inventory.values() for path in paths}
+            scraped = []
+            for target in targets:
+                if target in present:
+                    scraped.append(target)
+                else:
+                    print(f"WARNING: {target} does not exist under {prefix}: not indexed")
+
+            datasets, broken = list_datasets(fs, root, scraped)
+            for category in list(scraped):
+                print(f"{category}: {len(datasets[category])} datasets")
+                if not datasets[category]:
+                    # stac-scraper cannot write an empty collection
+                    print(f"WARNING: {category} holds no dataset: not indexed")
+                    scraped.remove(category)
+            if broken:
+                for path in broken:
+                    print(f"  no zarr.json: {prefix}/{path}")
+                fail(
+                    f"{len(broken)} dataset(s) without a root zarr.json (interrupted uploads?) "
+                    "would make stac-scraper fail: delete them or re-run the step that writes them"
+                )
+            if not scraped:
+                fail(f"none of {', '.join(targets)} exists with datasets under {prefix}")
+
+            target_groups = {category.split("/")[0] for category in scraped}
+            excluded_groups = sorted((set(groups) - target_groups) | set(ALWAYS_EXCLUDED))
+            excluded_categories = sorted(present - set(scraped))
+            print(f"groups under {prefix}: {', '.join(groups)}")
+            print(f"indexing: {', '.join(scraped)}")
+            print(f"excluded groups: {', '.join(excluded_groups)}")
+            print(f"excluded categories: {', '.join(excluded_categories) or '-'}")
+            expected = {parquet_name(category): category for category in scraped}
+
+            # stores of the targets left out of the index (they stay in the bucket)
+            excluded_stores = [
+                store
+                for store in dict.fromkeys(list(KNOWN_EXCLUDED_STORES) + requested_exclusions)
+                if "/".join(store.split("/")[:2]) in scraped
+            ]
+            native_exclusion = scraper_has_option("--exclude-stores")
+            for store in excluded_stores:
+                exists = fs.exists(f"{root}/{store}")
+                print(f"excluded store (kept in the bucket, not indexed): {prefix}/{store}"
+                      + ("" if exists else " (WARNING: does not exist)"))
+            for store in requested_exclusions:
+                if store not in excluded_stores:
+                    print(f"WARNING: exclude_stores: {store} is not in an indexed category: ignored")
+
+            stac_dir = pathlib.Path(WORK_DIR) / "stac"
+            generated_dir = pathlib.Path(WORK_DIR) / "copy-collections"
+            for directory in (stac_dir, generated_dir):
+                if directory.exists():
+                    shutil.rmtree(directory)
+                directory.mkdir(parents=True)
+
+            home = pathlib.Path(tempfile.mkdtemp(prefix="stac-scraper-home-"))
+            try:
+                env = scraper_env(home, prefix)
+                try:
+                    run_scraper(
+                        [
+                            "scrape-items",
+                            "--profile",
+                            AWS_PROFILE,
+                            "--endpoint",
+                            s3_endpoint,
+                            "--local-output-root",
+                            str(stac_dir),
+                            "--exclude-categories",
+                            ",".join(excluded_groups + excluded_categories),
+                            *(
+                                ["--exclude-stores", ",".join(excluded_stores)]
+                                if excluded_stores and native_exclusion
+                                else []
+                            ),
+                            prefix,
+                            "assets",
+                        ],
+                        env,
+                    )
+                except subprocess.CalledProcessError:
+                    # deterministic causes stop the run (exit 2); anything else
+                    # (network, S3) is retried
+                    print("scrape-items failed: checking the target datasets", flush=True)
+                    try:
+                        problems = diagnose_scrape(
+                            fs, root, {category: datasets[category] for category in scraped}
+                        )
+                    except Exception as error:  # best effort: the retry decides
+                        print(f"WARNING: could not check the target datasets: {error!r}")
+                        problems = []
+                    if not problems:
+                        raise
+                    for problem in problems[:MAX_REPORTED]:
+                        print(f"  {problem}")
+                    if len(problems) > MAX_REPORTED:
+                        print(f"  ... and {len(problems) - MAX_REPORTED} more")
+                    fail(
+                        "stac-scraper cannot index the target datasets (see above): "
+                        "nothing uploaded; fix or remove them and re-run"
+                    )
+
+                # only the parquet files of the targets are kept (and uploaded)
+                written = sorted(path.name for path in stac_dir.rglob("*.parquet"))
+                for name in written:
+                    if name not in expected:
+                        print(f"WARNING: {name} is not a target: discarded, not uploaded")
+                        for path in stac_dir.rglob(name):
+                            path.unlink()
+                missing = sorted(set(expected) - set(written))
+                if missing:
+                    fail(f"scrape-items wrote no {', '.join(missing)}", code=1)
+
+                # this stac-scraper cannot skip stores: remove their items instead
+                if excluded_stores and not native_exclusion:
+                    for name, category in expected.items():
+                        stores = [s for s in excluded_stores if s.startswith(category + "/")]
+                        if stores:
+                            removed = drop_excluded_items(stac_dir / name, stores)
+                            print(f"{name}: {removed} item(s) of excluded stores removed")
+
+                # duplicated item ids: the STAC API answers 404 for them
+                rows = {}
+                duplicated = False
+                for name, category in expected.items():
+                    items = read_parquet_items(stac_dir / name)
+                    rows[name] = len(items)
+                    duplicated |= report_duplicates(name, category, items)
+                if duplicated:
+                    fail(
+                        "duplicated item ids in the scraped parquet files: nothing uploaded. "
+                        "Add one store of each pair to exclude_stores (it stays in the bucket, "
+                        "only the index leaves it out), or give it a distinct stac_discovery id, "
+                        "and re-run"
+                    )
+
+                # the collections of the target parquet files (copy-collections on
+                # the local index, which only holds them)
+                run_scraper(
+                    [
+                        "copy-collections",
+                        "--local-output-root",
+                        str(generated_dir),
+                        str(stac_dir),
+                        "collections",
+                    ],
+                    env,
+                )
+            finally:
+                shutil.rmtree(home, ignore_errors=True)
+
+            generated_path = generated_dir / COLLECTIONS_JSON
+            generated = json.loads(generated_path.read_text())
+            shutil.copyfile(generated_path, stac_dir / "collections.generated.json")
+            targets_collections = target_collections(generated, expected)
+
+            live_remote = f"{root}/{COLLECTIONS_JSON}"
+            live_location = f"{prefix}/{COLLECTIONS_JSON}"
+            live_content = read_remote(fs, live_remote)
+            live = parse_live(live_content, live_location)
+            if live_content is not None:
+                (stac_dir / "collections.live.json").write_bytes(live_content)
+            merged, added, replaced, kept = merge_collections(
+                live, targets_collections, live_location
+            )
+            collections_path = stac_dir / COLLECTIONS_JSON
+            collections_path.write_text(json.dumps(merged))
+
+            print(
+                f"{COLLECTIONS_JSON}: {len(live)} published -> {len(merged)} merged collections"
+            )
+            print(
+                "  replaced: "
+                + (
+                    ", ".join(
+                        f"{cid} ({'unchanged' if same else 'changed'})"
+                        for cid, same in replaced
+                    )
+                    or "-"
+                )
+            )
+            print(f"  added: {', '.join(added) or '-'}")
+            print(f"  kept as published ({len(kept)}): {', '.join(kept) or '-'}")
+            print("  removed: - (never)")
+
+            remote_files = set(list_entries(fs, root, "file"))
+            plan = [(stac_dir / name, f"{root}/{name}") for name in expected]
+            plan.append((collections_path, live_remote))
+            print(
+                ("uploads" if publish else "dry run: would upload")
+                + " (collections.json last):"
+            )
+            for path, _ in plan:
+                state = "replace" if path.name in remote_files else "NEW"
+                count = (
+                    f"{rows[path.name]} items, "
+                    if path.name in rows
+                    else f"{len(merged)} collections, "
+                )
+                print(
+                    f"  {path.name}: {count}{path.stat().st_size} bytes -> {prefix}/{path.name} ({state})"
+                )
+
+            if not publish:
+                print(
+                    "dry run: nothing uploaded; the generated index is in the stac-index artifact"
+                )
+                return
+
+            for path, remote in plan[:-1]:
+                upload(fs, prefix, path, remote)
+            if read_remote(fs, live_remote) != live_content:
+                fail(
+                    f"{live_location} changed during this run: not uploaded "
+                    "(the parquet files are; the retry merges again)",
+                    code=1,
+                )
+            upload(fs, prefix, collections_path, live_remote)
+            print("done: STAC index updated")
+
+
+        if __name__ == "__main__":
+            main()
