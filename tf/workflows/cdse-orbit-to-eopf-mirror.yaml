@@ -9,7 +9,7 @@
 #                The STAC id (stac_discovery.id) of a new store is its product
 #                name (see "Item ids" below).
 #
-# Region (lat_range, default "45.0,49.0" = 45..49 N, Massif Central to Paris; the
+# Region (lat_range, default "48.0,50.0" = 48..50 N, around Paris; the
 # preset "france" = 41.3..51.2 stays available): the orbit is cut as a LATITUDE
 # BAND over the full swath width, snapped to HEALPix parent cells (align_level,
 # nested, WGS84) so that later regional products line up:
@@ -44,6 +44,35 @@
 # or orbit, bbox}.
 # In band mode bbox only picks the pass.
 #
+# Orbit choice (lon_range "min,max", band mode only): instead of reference_item /
+# relative_orbit / absolute_orbit, ONE orbit is chosen among the passes of datetime
+# (a closed window "start/end" of dates or datetimes; platform, if given, limits the
+# platforms): the pass whose valid-data footprints cover the largest part of the box
+# lon_range x lat_range (equal-area, sinusoidal), coverages within 1 % of the box
+# counting as equal; then the one whose swath centre at the middle latitude of the
+# box is closest to its middle longitude (per relative orbit: S2A / S2B / S2C share
+# the tracks); then the one closest to target_date (empty = middle of the window).
+# Orbits are never combined: the box may be covered only in part (the coverage is
+# printed). The chosen orbit is then cut as above (full swath width over the band);
+# extent_info gets orbit_choice {lon_range, datetime, target_date, coverage,
+# centre_offset_deg, candidates}. One Sentinel-2 swath (290 km) slants by ~1.4 deg of
+# longitude over 45..49 N, so it holds the whole box only when the box is ~2.4 deg
+# wide or less there.
+#
+# Study region (study_region: an id of the GRID4EARTH study-regions registry,
+# https://data.grid4earth.eu/regions.geoparquet, e.g. paris, or inline GeoJSON):
+# like lon_range, but only the passes whose valid data cover the WHOLE region
+# (99.9 %) are candidates (none: exit 2, the best coverage is printed); then the
+# swath centre closest to the middle of the region, then the date closest to
+# target_date. datetime defaults to that of the region (a range; a single date d
+# gives d +- 5 days and target d). The latitude band is set from the region: whole
+# degrees, at least 2 deg high (about two MGRS tiles; ~3 deg after the snapping to
+# the align_level cells), holding the region, its middle closest to the region's
+# (paris, 48.81..48.90 N -> 48..50); lat_range must stay at its default. The region
+# tag is the region id, upper-cased with "_" -> "-" (paris -> PARIS,
+# mont_blanc -> MONT-BLANC), unless region_name is given. extent_info.orbit_choice
+# gets study_region {id, name, bounds}.
+#
 # Region tag (last part of healpix_name, {platform}_{type}_{first sensing start}_
 # R{relative orbit}_O{absolute orbit}_{region}): an explicit region_name always
 # wins (upper-cased, except the "p" of a name shaped like a band tag, so that
@@ -51,7 +80,7 @@
 # lat_range preset name (france -> FRANCE); else, for
 # a numeric band, the band itself: hemisphere letter N / S and absolute degrees per
 # bound, integers without decimals and the decimal point of the others written
-# "p" (45.0,49.0 -> N45-N49; 41.3,51.2 -> N41p3-N51p2; -12.5,-3 -> S12p5-S3);
+# "p" (48.0,50.0 -> N48-N50; 41.3,51.2 -> N41p3-N51p2; -12.5,-3 -> S12p5-S3);
 # without lat_range the bbox preset (FRANCE) or REGION. The tag may only hold
 # letters, digits and "-" (the name is split on "_").
 #
@@ -63,8 +92,8 @@
 # Item ids: eopf (3.0 / rc4) gives every tile of one Sentinel-2 datatake the same
 # id except for a 3-hex-digit CRC (4096 values), e.g. S02MSIL2A_20250613T104641_0000_C051_T266:
 # among the 71 products of the France run (lat_range=france) of orbit 4025 the
-# chance of a duplicate is about 46 % (31 products of the default band 45..49 N:
-# about 11 %), and the STAC API answers 404 for every item of a duplicated id
+# chance of a duplicate is about 46 % (23 products of the default band 48..50 N:
+# about 6 %; 31 of 45..49 N: about 11 %), and the STAC API answers 404 for every item of a duplicated id
 # (stac-scraper-update then stops). mirror-item therefore sets the
 # stac_discovery.id of the store it uploads to the product name: the store name
 # without .zarr and without a .SEN3 / .SAFE suffix, e.g.
@@ -115,10 +144,19 @@ spec:
         description: manual mode, client-side filter on sat:absolute_orbit
       - name: datetime
         value: ""
-        description: manual mode, STAC datetime range start/end
+        description: manual mode, STAC datetime range start/end; with lon_range / study_region the window the orbit is chosen in (start/end of dates or datetimes)
+      - name: lon_range
+        value: ""
+        description: min,max (deg) - choose ONE orbit, the pass of datetime with the most valid data in lon_range x lat_range (leave reference_item, relative_orbit and absolute_orbit empty); empty = off
+      - name: study_region
+        value: ""
+        description: id of a GRID4EARTH study region (e.g. paris) or inline GeoJSON - choose ONE orbit whose valid data cover the whole region; the latitude band (>= 2 deg, whole degrees) and the region tag (PARIS) follow from it; empty = off
+      - name: target_date
+        value: ""
+        description: with lon_range / study_region, among passes with equal coverage and track the one closest to this date (YYYY-MM-DD or ISO datetime); empty = middle of datetime (or the date of the study region)
       - name: lat_range
-        value: "45.0,49.0"
-        description: latitude band min,max (deg, default 45..49 N) or the preset "france" (41.3,51.2), cut over the full swath width and snapped to align_level cells; empty (or "none") = use bbox
+        value: "48.0,50.0"
+        description: latitude band min,max (deg, default 48..50 N) or the preset "france" (41.3,51.2), cut over the full swath width and snapped to align_level cells; empty (or "none") = use bbox
       - name: align_level
         value: "7"
         description: HEALPix level (nested, WGS84) of the parent cells the band is snapped to, 0..11 (not above the chunk level of the conversion settings)
@@ -131,7 +169,7 @@ spec:
         description: minx,miny,maxx,maxy or the preset "france"; with lat_range it only picks the pass when the orbit crosses the band twice; without lat_range it is the region (empty = whole orbit)
       - name: region_name
         value: ""
-        description: last part of the HEALPix output name (letters, digits and '-', upper-cased; the 'p' of a band-shaped name stays lower case); empty = the band tag (lat_range 45.0,49.0 -> N45-N49, 41.3,... -> N41p3-...), FRANCE for lat_range "france" (or, without lat_range, the France bbox), else REGION
+        description: last part of the HEALPix output name (letters, digits and '-', upper-cased; the 'p' of a band-shaped name stays lower case); empty = the band tag (lat_range 48.0,50.0 -> N48-N50, 41.3,... -> N41p3-...), FRANCE for lat_range "france" (or, without lat_range, the France bbox), else REGION
       - name: mirror_prefix
         value: s3://grid4earth/public/eopf-mirror
       - name: converted_prefix
@@ -161,6 +199,9 @@ spec:
         - name: relative_orbit
         - name: absolute_orbit
         - name: datetime
+        - name: lon_range
+        - name: study_region
+        - name: target_date
         - name: lat_range
         - name: align_level
         - name: align_rule
@@ -199,6 +240,12 @@ spec:
                 value: "{{inputs.parameters.absolute_orbit}}"
               - name: datetime
                 value: "{{inputs.parameters.datetime}}"
+              - name: lon_range
+                value: "{{inputs.parameters.lon_range}}"
+              - name: study_region
+                value: "{{inputs.parameters.study_region}}"
+              - name: target_date
+                value: "{{inputs.parameters.target_date}}"
               - name: lat_range
                 value: "{{inputs.parameters.lat_range}}"
               - name: align_level
@@ -263,6 +310,9 @@ spec:
         - name: relative_orbit
         - name: absolute_orbit
         - name: datetime
+        - name: lon_range
+        - name: study_region
+        - name: target_date
         - name: lat_range
         - name: align_level
         - name: align_rule
@@ -334,6 +384,9 @@ spec:
           * fail unless exactly one absolute orbit remains;
           * band mode (lat_range set): cut the orbit as a latitude band over the full
             swath width, snapped to HEALPix cells of align_level (select_band);
+          * lon_range / study_region: choose ONE orbit in the datetime window, the pass
+            with the most valid data in the box, or one that covers the whole study
+            region (pick_orbit); a study region also sets the band and the region tag;
           * optionally find each product on the EOPF Sample Service (one search over
             the whole orbit): same id first, else same sensing (S2: id without the
             processing time; S3: sensing start/stop, timeliness and baseline) within
@@ -348,7 +401,7 @@ spec:
         import sys
         import urllib.request
         from collections import Counter
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
 
         import pystac_client
 
@@ -358,6 +411,9 @@ spec:
         relative_orbit = "{{inputs.parameters.relative_orbit}}"
         absolute_orbit = "{{inputs.parameters.absolute_orbit}}"
         datetime_range = "{{inputs.parameters.datetime}}"
+        lon_range = "{{inputs.parameters.lon_range}}"
+        study_region = r'''{{inputs.parameters.study_region}}'''
+        target_date = "{{inputs.parameters.target_date}}"
         lat_range = "{{inputs.parameters.lat_range}}"
         align_level = "{{inputs.parameters.align_level}}"
         align_rule = "{{inputs.parameters.align_rule}}"
@@ -385,6 +441,26 @@ spec:
         # an explicit region_name of this shape keeps the lower-case "p" of band_tag
         BAND_TAG = re.compile(r"[NS]\d+(?:P\d+)?-[NS]\d+(?:P\d+)?")
         LAT_RANGE_OFF = ("", "none")  # lat_range values that select bbox mode
+        DEFAULT_LAT_RANGE = [48.0, 50.0]  # the default of lat_range (a study region sets its own)
+        LON_RANGE_OFF = ("", "none")  # lon_range values that leave the orbit choice off
+        # orbit choice (lon_range / study_region): nominal swath widths (km) by which the
+        # search is widened east and west, so that the swath centre at the middle
+        # latitude of the area is found whole; coverage fractions of the lon_range box
+        # closer than COVERAGE_TIE count as equal; a study region needs FULL_COVERAGE;
+        # candidates printed / kept in extent_info
+        SWATH_WIDTH_KM = {"sentinel-2": 290.0, "sentinel-3": 1500.0}
+        KM_PER_DEG = 111.32
+        COVERAGE_TIE = 0.01
+        FULL_COVERAGE = 0.999
+        ORBIT_CHOICE_PRINT = 15
+        ORBIT_CHOICE_KEEP = 8
+        # study regions: registry (GeoParquet, id / name / geometry WKB / datetime),
+        # minimum band height (deg; one MGRS tile is ~0.99 deg high), window around a
+        # single-date region (days)
+        STUDY_REGIONS_URL = "https://data.grid4earth.eu/regions.geoparquet"
+        STUDY_REGIONS_ATTEMPTS = 3
+        MIN_BAND_DEG = 2
+        SINGLE_DATE_DAYS = 5
         # band mode: HEALPix grid of the parent cells (that of the conversion settings)
         HEALPIX_ELLIPSOID = "WGS84"
         HEALPIX_INDEXING = "nested"
@@ -992,6 +1068,252 @@ spec:
             return selected, geojson, info
 
 
+        def parse_lon_range(value):
+            """[min, max] from "min,max" (deg, -180..180, min < max); None when empty or "none"."""
+            text = value.strip()
+            if text.lower() in LON_RANGE_OFF:
+                return None
+            try:
+                parts = [float(v) for v in text.split(",")]
+            except ValueError:
+                parts = []
+            if len(parts) != 2:
+                fail(f"lon_range must be min,max or empty / 'none', got {value!r}")
+            if not -180 <= parts[0] < parts[1] <= 180:
+                fail(f"lon_range needs -180 <= min < max <= 180 (no antimeridian crossing), got {value!r}")
+            return parts
+
+
+        def parse_when(text, day_time):
+            """Aware datetime of an ISO datetime (UTC when it has no zone) or date (at day_time)."""
+            text = text.strip()
+            when = parse_dt(text + day_time if len(text) == 10 else text)
+            return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+        def parse_window(value, what="datetime"):
+            """(start, end) of the window the orbit is chosen in: a closed range "start/end"
+            of dates (whole days) or ISO datetimes."""
+            parts = value.strip().split("/")
+            try:
+                start, end = parse_when(parts[0], "T00:00:00Z"), parse_when(parts[1], "T23:59:59Z")
+            except (IndexError, ValueError):
+                start = end = None
+            if len(parts) != 2 or start is None or start >= end:
+                fail(f"{what} must be a closed range start/end of dates or datetimes "
+                     f"(e.g. 2025-06-08/2025-06-18), got {value!r}")
+            return start, end
+
+
+        def parse_target(value, window):
+            """target_date as an aware datetime (a date is its 12:00 UTC); empty = middle of window."""
+            text = value.strip()
+            if not text:
+                return window[0] + (window[1] - window[0]) / 2
+            try:
+                return parse_when(text, "T12:00:00Z")
+            except ValueError:
+                fail(f"target_date must be YYYY-MM-DD or an ISO datetime, got {value!r}")
+
+
+        def read_study_regions():
+            """{id: row} of the study region registry (GeoParquet, geometry as WKB); a
+            connection error is retried STUDY_REGIONS_ATTEMPTS times, then raised."""
+            import io
+            import time
+
+            import pyarrow.parquet as pq
+            import requests
+
+            for attempt in range(1, STUDY_REGIONS_ATTEMPTS + 1):
+                try:
+                    response = requests.get(STUDY_REGIONS_URL, timeout=HTTP_TIMEOUT)
+                    response.raise_for_status()
+                    break
+                except requests.RequestException as exc:
+                    if attempt == STUDY_REGIONS_ATTEMPTS:
+                        raise
+                    print(f"reading {STUDY_REGIONS_URL} failed ({exc!r}), retrying")
+                    time.sleep(5 * attempt)
+            table = pq.read_table(io.BytesIO(response.content))
+            return {row["id"]: row for row in table.to_pylist()}
+
+
+        def load_study_region(value):
+            """(geometry, id, name, datetime) of study_region: an id of the GRID4EARTH
+            study-regions registry, or inline GeoJSON (geometry, Feature or FeatureCollection,
+            Polygon / MultiPolygon in lon/lat; id, name and datetime from the properties of
+            its first Feature, if any)."""
+            import shapely
+            from shapely.geometry import shape
+            from shapely.ops import unary_union
+
+            text = value.strip()
+            if text.startswith("{"):
+                try:
+                    obj = json.loads(text)
+                    parts = obj["features"] if obj.get("type") == "FeatureCollection" else [obj]
+                    geoms = [shape(p["geometry"] if p.get("type") == "Feature" else p) for p in parts]
+                except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                    fail(f"study_region is not valid GeoJSON: {exc}")
+                props = (parts[0].get("properties") or {}) if parts[0].get("type") == "Feature" else {}
+                geom, region_id = unary_union(geoms), props.get("id")
+                name, region_dt = props.get("name"), props.get("datetime")
+            else:
+                regions = read_study_regions()
+                row = regions.get(text)
+                if row is None:
+                    fail(f"unknown study region {text!r}; known: {sorted(regions)} ({STUDY_REGIONS_URL})")
+                geom, region_id = shapely.from_wkb(row["geometry"]), text
+                name, region_dt = row.get("name"), row.get("datetime")
+            if not geom.is_valid:
+                geom = geom.buffer(0)
+            if geom.is_empty or geom.geom_type not in ("Polygon", "MultiPolygon") or geom.area <= 0:
+                fail(f"study_region must be a Polygon or MultiPolygon, got {geom.geom_type}")
+            x0, y0, x1, y1 = geom.bounds
+            if not (-180 <= x0 and x1 <= 180 and -90 <= y0 and y1 <= 90) or x1 - x0 > 180:
+                fail(f"study_region must lie in lon -180..180 / lat -90..90 without crossing the "
+                     f"antimeridian, bounds {geom.bounds}")
+            return geom, region_id, name, region_dt
+
+
+        def region_tag(region_id):
+            """REGION tag of a study region id: upper case, "_" -> "-" (paris -> PARIS,
+            mont_blanc -> MONT-BLANC)."""
+            return str(region_id).strip().upper().replace("_", "-")
+
+
+        def region_band(geom):
+            """Latitude band of a study region: whole degrees, at least MIN_BAND_DEG high,
+            holding the region; of the possible bands the one whose middle is closest to the
+            middle of the region (the lower one on a tie). paris (48.81..48.90) -> 48..50."""
+            lat_min, lat_max = geom.bounds[1], geom.bounds[3]
+            height = max(MIN_BAND_DEG, math.ceil(lat_max) - math.floor(lat_min))
+            middle = (lat_min + lat_max) / 2
+            starts = range(math.ceil(lat_max) - height, math.floor(lat_min) + 1)
+            start = min(starts, key=lambda b: (abs(b + height / 2 - middle), b))
+            start = min(max(start, -90), 90 - height)
+            return [float(start), float(start + height)]
+
+
+        def region_window(datetime_value, target_value, region_dt, region_id):
+            """(window, target) of the orbit choice of a study region: datetime if given, else
+            the datetime of the region (a range, or a date +- SINGLE_DATE_DAYS that is also the
+            default target)."""
+            if datetime_value.strip():
+                window = parse_window(datetime_value)
+                return window, parse_target(target_value, window)
+            if not region_dt:
+                fail(f"study region {region_id!r} has no datetime: give datetime (start/end)")
+            if "/" in region_dt:
+                window = parse_window(region_dt, f"the datetime of study region {region_id!r}")
+                return window, parse_target(target_value, window)
+            try:
+                day = parse_when(region_dt, "T12:00:00Z")
+            except ValueError:
+                fail(f"cannot read the datetime {region_dt!r} of study region {region_id!r}: give datetime")
+            window = (day - timedelta(days=SINGLE_DATE_DAYS), day + timedelta(days=SINGLE_DATE_DAYS))
+            return window, (parse_target(target_value, window) if target_value.strip() else day)
+
+
+        def equal_area(geom):
+            """geom in the sinusoidal projection (x = lon * cos(lat), y = lat, deg): equal-area,
+            so that areas at different latitudes compare."""
+            import numpy as np
+            from shapely.ops import transform
+
+            return transform(lambda x, y, z=None: (np.asarray(x) * np.cos(np.radians(y)), y), geom)
+
+
+        def pick_orbit(client, plat, window, area, target, limit_items, need_full, label):
+            """The ONE pass chosen for `area` (the lon_range x lat_range box, or a study
+            region), see "Orbit choice" in the template header. need_full: only passes whose
+            valid data cover the whole area (study region); else the passes with the most
+            data. Returns (chosen candidate, choice info); the candidate has platform,
+            absolute_orbit, relative_orbit, datetime (start of the pass) and item (the id of
+            one of its products)."""
+            from shapely.geometry import LineString
+            from shapely.ops import unary_union
+
+            lon_min, lat_min, lon_max, lat_max = area.bounds
+            lon_c, lat_c = (lon_min + lon_max) / 2, (lat_min + lat_max) / 2
+            # widen the search by one swath width so that the swath centre at lat_c is found whole
+            width_km = SWATH_WIDTH_KM["sentinel-2" if collection.startswith("sentinel-2") else "sentinel-3"]
+            widen = width_km / (KM_PER_DEG * max(math.cos(math.radians(max(abs(lat_min), abs(lat_max)))), 0.05))
+            search = [max(-180.0, lon_min - widen), lat_min, min(180.0, lon_max + widen), lat_max]
+            dt = f"{window[0].isoformat()}/{window[1].isoformat()}"
+            found = search_orbit(client, plat or None, None, dt, search, limit_items)
+            if len(found) >= limit_items:
+                fail(f"the orbit choice search hit max_items={limit_items}: narrow datetime or raise max_items")
+            passes = {}
+            for item in found:
+                p = item.properties
+                key = (p.get("platform"), p.get("sat:absolute_orbit"))
+                if None not in key and (not plat or key[0] == plat):
+                    passes.setdefault(key, []).append(item)
+            area_size = equal_area(area).area
+            centre_line = LineString([(search[0], lat_c), (search[2], lat_c)])
+            rows = []
+            for (pf, ao), its in passes.items():
+                swath = unary_union([footprint(i) for i in its])
+                coverage = equal_area(swath.intersection(area)).area / area_size
+                if coverage <= 0:
+                    continue
+                cut = swath.intersection(centre_line)
+                centre = None if cut.is_empty else (cut.bounds[0] + cut.bounds[2]) / 2
+                start = min(parse_dt(i.properties["datetime"]) for i in its)
+                rel = {relative_orbit_of(i) for i in its} - {None}
+                rows.append({
+                    "platform": pf, "absolute_orbit": int(ao),
+                    "relative_orbit": rel.pop() if len(rel) == 1 else None,
+                    "datetime": start.isoformat().replace("+00:00", "Z"),
+                    "coverage": round(coverage, 4),
+                    "centre_offset_deg": None if centre is None else round(abs(centre - lon_c), 3),
+                    "days_from_target": round(abs((start - target).total_seconds()) / 86400, 2),
+                    "item": min(i.id for i in its),
+                })
+            if not rows:
+                fail(f"no orbit has data in {label} between {dt}")
+            # 1. most data (study region: the whole region; coverages within COVERAGE_TIE are
+            # equal), 2. swath centre closest to the centre of the area (passes of one
+            # relative orbit share their track, so their offsets are compared per relative
+            # orbit), 3. date closest to target_date
+            best = max(r["coverage"] for r in rows)
+            if need_full:
+                tied = [r for r in rows if r["coverage"] >= FULL_COVERAGE]
+            else:
+                tied = [r for r in rows if r["coverage"] >= best - COVERAGE_TIE]
+            offsets = {}
+            for r in tied:
+                if r["centre_offset_deg"] is not None:
+                    offsets.setdefault(r["relative_orbit"], []).append(r["centre_offset_deg"])
+            track_offset = {k: min(v) for k, v in offsets.items()}
+
+            def track(r):
+                return track_offset.get(r["relative_orbit"], math.inf)
+
+            chosen = min(tied, key=lambda r: (track(r), r["days_from_target"], r["datetime"])) if tied else None
+            rows.sort(key=lambda r: (-r["coverage"], track(r), r["days_from_target"]))
+            print(f"orbit choice: {label}, {dt}, target {target.isoformat()}; {len(rows)} passes with data:")
+            for r in rows[:ORBIT_CHOICE_PRINT]:
+                mark = "*" if r is chosen else " "
+                print(f" {mark} {r['platform']} R{r['relative_orbit']} O{r['absolute_orbit']} {r['datetime']} "
+                      f"coverage {100 * r['coverage']:.1f}% centre offset {r['centre_offset_deg']} deg "
+                      f"{r['days_from_target']} d from target")
+            if chosen is None:
+                fail(f"no orbit covers the whole {label} between {dt} (best {100 * best:.1f}%): the region "
+                     "may be wider than one swath, or the window too short")
+            if chosen["coverage"] < 1 - COVERAGE_TIE:
+                print(f"note: the chosen orbit covers {100 * chosen['coverage']:.1f}% of the {label}; "
+                      "one orbit is never combined with another")
+            info = {
+                "datetime": dt, "target_date": target.isoformat(),
+                "coverage": chosen["coverage"], "centre_offset_deg": chosen["centre_offset_deg"],
+                "candidates": [{k: v for k, v in r.items() if k != "item"} for r in rows[:ORBIT_CHOICE_KEEP]],
+            }
+            return chosen, info
+
+
         def main():
             g4e_collection = G4E_COLLECTIONS.get(collection)
             if g4e_collection is None:
@@ -1001,14 +1323,71 @@ spec:
             level = parse_align_level(align_level)
             rule = parse_align_rule(align_rule)
             bbox_list, bbox_preset = parse_bbox(bbox)
-            # band mode: the band names the output and bbox only picks the pass
-            region = resolve_region_name(region_name, lat_band, lat_preset, bbox_preset)
+            lon_box = parse_lon_range(lon_range)
+            study = None
+            if lon_box and study_region.strip():
+                fail("give lon_range or study_region, not both")
+            if lon_box and not lat_band:
+                fail("lon_range needs lat_range (band mode)")
+            if target_date.strip() and not (lon_box or study_region.strip()):
+                fail("target_date is only used with lon_range or study_region")
+            if study_region.strip():
+                if lat_band != DEFAULT_LAT_RANGE or lat_preset:
+                    fail(f"study_region sets the latitude band from the region; leave lat_range at "
+                         f"its default {DEFAULT_LAT_RANGE[0]},{DEFAULT_LAT_RANGE[1]}")
+                geom, study_id, study_name, study_dt = load_study_region(study_region)
+                lat_band = region_band(geom)
+                print(f"study region {study_id or '(inline)'} ({study_name or '-'}): bounds "
+                      f"{[round(v, 4) for v in geom.bounds]}, latitude band {lat_band[0]}..{lat_band[1]}")
+                if not region_name.strip() and not study_id:
+                    fail("an inline study_region without properties.id needs region_name")
+                study = {"geom": geom, "id": study_id, "name": study_name, "datetime": study_dt}
+            # band mode: the band names the output and bbox only picks the pass; a study
+            # region names it after the region
+            region = resolve_region_name(
+                region_name or (region_tag(study["id"]) if study else ""), lat_band, lat_preset, bbox_preset)
             print(f"region tag: {region}")
             if check_sample_service.strip().lower() not in ("true", "false"):
                 fail(f"check_sample_service must be 'true' or 'false', got {check_sample_service!r}")
             client = open_client(CDSE_STAC_URL)
 
-            if reference_item.strip():
+            orbit_choice = None
+            if lon_box or study:
+                taken = [name for name, value in (
+                    ("reference_item", reference_item), ("relative_orbit", relative_orbit),
+                    ("absolute_orbit", absolute_orbit),
+                ) if value.strip()]
+                if taken:
+                    fail(f"{'lon_range' if lon_box else 'study_region'} chooses the orbit; "
+                         f"leave {', '.join(taken)} empty")
+                if study:
+                    window, target = region_window(datetime_range, target_date, study["datetime"],
+                                                   study["id"] or "(inline)")
+                    chosen, orbit_choice = pick_orbit(
+                        client, platform.strip(), window, study["geom"], target, limit_items, True,
+                        f"study region {study['id'] or '(inline)'}")
+                    orbit_choice["study_region"] = {
+                        "id": study["id"], "name": study["name"],
+                        "bounds": [round(v, EXTENT_DECIMALS) for v in study["geom"].bounds],
+                    }
+                    orbit_choice["lat_range"] = lat_band
+                else:
+                    from shapely.geometry import box
+
+                    window = parse_window(datetime_range)
+                    target = parse_target(target_date, window)
+                    chosen, orbit_choice = pick_orbit(
+                        client, platform.strip(), window, box(lon_box[0], lat_band[0], lon_box[1], lat_band[1]),
+                        target, limit_items, False,
+                        f"box lon {lon_box[0]}..{lon_box[1]} x lat {lat_band[0]}..{lat_band[1]}")
+                    orbit_choice["lon_range"] = lon_box
+                plat, abs_orbit = chosen["platform"], chosen["absolute_orbit"]
+                rel_orbit, ref_id = chosen["relative_orbit"], chosen["item"]
+                t0 = parse_dt(chosen["datetime"])
+                dt = f"{(t0 - ORBIT_PERIOD).isoformat()}/{(t0 + ORBIT_PERIOD).isoformat()}"
+                print(f"chosen: {plat} absolute_orbit={abs_orbit} relative_orbit={rel_orbit} "
+                      f"(item {ref_id})\n  datetime window={dt}")
+            elif reference_item.strip():
                 manual = [name for name, value in (
                     ("platform", platform), ("relative_orbit", relative_orbit),
                     ("absolute_orbit", absolute_orbit), ("datetime", datetime_range),
@@ -1080,6 +1459,8 @@ spec:
                 items, extent, extent_info = select_band(items, ref_id, bbox_list, lat_band, level, rule)
                 if not items:
                     fail("no product of the orbit intersects the band region")
+                if orbit_choice:
+                    extent_info["orbit_choice"] = orbit_choice
                 output_extent = json.dumps(extent, separators=(",", ":"))
             else:
                 output_extent = ""

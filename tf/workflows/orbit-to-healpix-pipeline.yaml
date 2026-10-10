@@ -42,8 +42,8 @@
 # to the legacy_converters bundled converter (the no_chunk groups stay empty) and
 # update-stac cannot run (no stac-scraper): set update_stac=false then.
 #
-# Region: by default (lat_range=45.0,49.0) the orbit is cut as the latitude band
-# 45..49 N (Massif Central to Paris; the preset "france" = 41.3..51.2 stays
+# Region: by default (lat_range=48.0,50.0) the orbit is cut as the latitude band
+# 48..50 N (around Paris; the preset "france" = 41.3..51.2 stays
 # available) over the full swath width, snapped to HEALPix cells of align_level
 # (default 7, nested, WGS84; align_rule intersects or within) so that regional
 # products of different orbits line up. The union of the kept cells is ONE
@@ -57,11 +57,24 @@
 # lat_range "" (or "none") the products are selected with bbox (empty = whole
 # orbit) and the output is not clipped. See cdse-orbit-to-eopf-mirror for the
 # details.
+# Orbit choice: with lon_range (min,max) and datetime (a window, e.g.
+# 2025-06-08/2025-06-18) instead of reference_item, ONE orbit is chosen: the pass
+# with the most valid data in lon_range x lat_range; ties (within 1 % of the box)
+# go to the swath centre closest to the box centre, then to the pass closest to
+# target_date (empty = middle of the window). Orbits are never combined, so the
+# box may be covered only in part; the chosen orbit is converted over its full
+# swath width as above.
+# Study region: with study_region (an id of the GRID4EARTH study-regions registry,
+# e.g. paris, or inline GeoJSON) ONE orbit whose valid data cover the WHOLE region
+# is chosen the same way (none: the run stops at the query); datetime defaults to
+# that of the region, the latitude band is set from the region (whole degrees, at
+# least 2 deg high: paris -> 48..50) and the output is named after it
+# (..._R051_O4025_PARIS).
 # The output is named {platform}_{type}_{first sensing start}_R{relative orbit}_
 # O{absolute orbit}_{region}: region_name if given (upper-cased; a band-shaped name
 # keeps a lower-case "p"), else FRANCE for the preset, else the band tag
-# (45.0,49.0 -> N45-N49, 41.3,51.2 -> N41p3-N51p2), e.g.
-# converted/sentinel-2-l2a/S2C_MSIL2A_20250613T104641_R051_O4025_N45-N49.zarr.
+# (48.0,50.0 -> N48-N50, 41.3,51.2 -> N41p3-N51p2), e.g.
+# converted/sentinel-2-l2a/S2C_MSIL2A_20250613T104641_R051_O4025_N48-N50.zarr.
 #
 # Conversion sizing (see healpix-convert-multistage): one conversion pod = 1 CPU, one
 # thread; "standard" pods 4 Gi requested / 8 Gi limit, "large" pods 7 Gi / 10 Gi for
@@ -73,7 +86,9 @@
 # with 48 pods (19 large + 29 standard, ~249 Gi requested, about 5 b3-64 nodes)
 # ~3.9 h of conversion, with 64 (~328 Gi, 6 nodes) ~3.3 h, with 32 (~167 Gi, 3
 # nodes) ~5.8 h (the longest lane, 1.15-1.3x the mean: chunks without data gather
-# in some tasks).
+# in some tasks). The default band 48..50 N has 57 % of those chunks (11264 per
+# group, 44 cells, 23 products): ~92-94 CPU-hours, ~2.2 h with 48 pods (scaled
+# from 45..49 N, not measured).
 #
 # Re-running on the same orbit: mirrored products are skipped, but the
 # conversion refuses an existing output unless overwrite=true. To resume a run
@@ -115,10 +130,19 @@ spec:
         description: manual mode, sat:absolute_orbit (filtered client-side)
       - name: datetime
         value: ""
-        description: manual mode, STAC datetime range start/end (required without reference_item)
+        description: manual mode, STAC datetime range start/end (required without reference_item); with lon_range / study_region the window the orbit is chosen in (start/end of dates or datetimes; empty with study_region = the datetime of the region)
+      - name: lon_range
+        value: ""
+        description: min,max (deg) - choose ONE orbit, the pass of datetime with the most valid data in lon_range x lat_range (leave reference_item, relative_orbit and absolute_orbit empty); empty = off
+      - name: study_region
+        value: ""
+        description: id of a GRID4EARTH study region (e.g. paris) or inline GeoJSON - choose ONE orbit whose valid data cover the whole region; the latitude band (>= 2 deg, whole degrees) and the region tag (PARIS) follow from it; leave lat_range at its default; empty = off
+      - name: target_date
+        value: ""
+        description: with lon_range / study_region, among passes with equal coverage and track the one closest to this date (YYYY-MM-DD or ISO datetime); empty = middle of datetime (or the date of the study region)
       - name: lat_range
-        value: "45.0,49.0"
-        description: latitude band min,max (deg, default 45..49 N) or "france" (41.3,51.2), cut over the full swath width and snapped to align_level cells; empty (or "none") = select with bbox
+        value: "48.0,50.0"
+        description: latitude band min,max (deg, default 48..50 N) or "france" (41.3,51.2), cut over the full swath width and snapped to align_level cells; empty (or "none") = select with bbox
       - name: align_level
         value: "7"
         description: HEALPix level (nested, WGS84) of the parent cells the band is snapped to, 0..11 and not above the chunk level of settings_name (S2 11, S3 6, S3 PSF 7)
@@ -131,7 +155,7 @@ spec:
         description: minx,miny,maxx,maxy or "france"; with lat_range it only picks the pass (orbit crossing the band twice); without lat_range it is the region (empty = whole orbit)
       - name: region_name
         value: ""
-        description: last part of the HEALPix output name (letters, digits and '-', upper-cased; the 'p' of a band-shaped name stays lower case); empty = the band tag (lat_range 45.0,49.0 -> N45-N49, 41.3,... -> N41p3-...), FRANCE for lat_range "france" (or, without lat_range, the France bbox), else REGION
+        description: last part of the HEALPix output name (letters, digits and '-', upper-cased; the 'p' of a band-shaped name stays lower case); empty = the band tag (lat_range 48.0,50.0 -> N48-N50, 41.3,... -> N41p3-...), FRANCE for lat_range "france" (or, without lat_range, the France bbox), else REGION
       - name: check_sample_service
         value: "true"
         enum: ["true", "false"]
@@ -197,6 +221,9 @@ spec:
         - name: relative_orbit
         - name: absolute_orbit
         - name: datetime
+        - name: lon_range
+        - name: study_region
+        - name: target_date
         - name: lat_range
         - name: align_level
         - name: align_rule
@@ -254,6 +281,12 @@ spec:
                 value: "{{inputs.parameters.absolute_orbit}}"
               - name: datetime
                 value: "{{inputs.parameters.datetime}}"
+              - name: lon_range
+                value: "{{inputs.parameters.lon_range}}"
+              - name: study_region
+                value: "{{inputs.parameters.study_region}}"
+              - name: target_date
+                value: "{{inputs.parameters.target_date}}"
               - name: lat_range
                 value: "{{inputs.parameters.lat_range}}"
               - name: align_level
@@ -312,6 +345,12 @@ spec:
                 value: "{{inputs.parameters.absolute_orbit}}"
               - name: datetime
                 value: "{{inputs.parameters.datetime}}"
+              - name: lon_range
+                value: "{{inputs.parameters.lon_range}}"
+              - name: study_region
+                value: "{{inputs.parameters.study_region}}"
+              - name: target_date
+                value: "{{inputs.parameters.target_date}}"
               - name: lat_range
                 value: "{{inputs.parameters.lat_range}}"
               - name: align_level
@@ -407,6 +446,9 @@ spec:
         - name: relative_orbit
         - name: absolute_orbit
         - name: datetime
+        - name: lon_range
+        - name: study_region
+        - name: target_date
         - name: lat_range
         - name: align_level
         - name: align_rule
@@ -478,6 +520,9 @@ spec:
         relative_orbit = "{{inputs.parameters.relative_orbit}}"
         absolute_orbit = "{{inputs.parameters.absolute_orbit}}"
         datetime_range = "{{inputs.parameters.datetime}}"
+        lon_range = "{{inputs.parameters.lon_range}}"
+        study_region = r'''{{inputs.parameters.study_region}}'''
+        target_date = "{{inputs.parameters.target_date}}"
         lat_range = "{{inputs.parameters.lat_range}}"
         align_level = "{{inputs.parameters.align_level}}"
         align_rule = "{{inputs.parameters.align_rule}}"
@@ -516,6 +561,9 @@ spec:
         # band mode, same rules as cdse-orbit-to-eopf-mirror (query)
         LAT_RANGE_PRESETS = ("france",)
         LAT_RANGE_OFF = ("", "none")  # bbox mode
+        LON_RANGE_OFF = ("", "none")  # no orbit choice
+        DEFAULT_LAT_RANGE = (48.0, 50.0)  # the default of lat_range (a study region sets its own)
+        STUDY_REGION_ID = re.compile(r"[A-Za-z0-9_-]+")
         MAX_ALIGN_LEVEL = 11
         ALIGN_RULES = ("intersects", "within")
         # CDSE collection id -> G4E collection id (= legacy_converters settings name);
@@ -571,6 +619,70 @@ spec:
                 return
             if not -90 <= lat_min < lat_max <= 90:
                 errors.append(f"lat_range needs -90 <= min < max <= 90, got {value!r}")
+
+
+        def check_orbit_choice(errors):
+            """lon_range / study_region (orbit choice): not both, no orbit numbers; lon_range
+            min,max in -180..180, band mode and a closed datetime window; study_region an id
+            or a GeoJSON object, lat_range at its default; target_date only with one of
+            them. True when the orbit is chosen."""
+            choose_lon = lon_range.strip().lower() not in LON_RANGE_OFF
+            choose_region = bool(study_region.strip())
+            if not (choose_lon or choose_region):
+                if target_date.strip():
+                    errors.append("target_date is only used with lon_range or study_region")
+                return False
+            if choose_lon and choose_region:
+                errors.append("give lon_range or study_region, not both")
+            taken = [name for name, value in (("reference_item", reference_item),
+                                              ("relative_orbit", relative_orbit),
+                                              ("absolute_orbit", absolute_orbit)) if value.strip()]
+            if taken:
+                errors.append(f"{'lon_range' if choose_lon else 'study_region'} chooses the orbit; "
+                              f"leave {', '.join(taken)} empty")
+            window_ok = len(datetime_range.strip().split("/")) == 2 and ".." not in datetime_range
+            if choose_lon:
+                try:
+                    lon_min, lon_max = (float(v) for v in lon_range.split(","))
+                except ValueError:
+                    errors.append(f"lon_range must be min,max or empty / 'none', got {lon_range!r}")
+                else:
+                    if not -180 <= lon_min < lon_max <= 180:
+                        errors.append(f"lon_range needs -180 <= min < max <= 180 (no antimeridian crossing), "
+                                      f"got {lon_range!r}")
+                if lat_range.strip().lower() in LAT_RANGE_OFF:
+                    errors.append("lon_range needs lat_range (band mode)")
+                if not window_ok:
+                    errors.append(f"lon_range needs datetime as a closed window start/end (e.g. "
+                                  f"2025-06-08/2025-06-18), got {datetime_range!r}")
+            if choose_region:
+                text = study_region.strip()
+                if text.startswith("{"):
+                    try:
+                        obj = json.loads(text)
+                    except ValueError as exc:
+                        errors.append(f"study_region is not valid JSON: {exc}")
+                    else:
+                        if not isinstance(obj, dict) or "type" not in obj:
+                            errors.append("study_region must be a GeoJSON geometry, Feature or FeatureCollection")
+                        else:
+                            first = (obj.get("features") or [{}])[0] if obj["type"] == "FeatureCollection" else obj
+                            props = (first.get("properties") or {}) if isinstance(first, dict) else {}
+                            if not props.get("id") and not region_name.strip():
+                                errors.append("an inline study_region without properties.id needs region_name")
+                elif not STUDY_REGION_ID.fullmatch(text):
+                    errors.append(f"study_region must be a study region id or GeoJSON, got {text[:80]!r}")
+                try:
+                    band = tuple(float(v) for v in lat_range.split(","))
+                except ValueError:
+                    band = None
+                if band != DEFAULT_LAT_RANGE:
+                    errors.append(f"study_region sets the latitude band from the region; leave lat_range at "
+                                  f"its default {DEFAULT_LAT_RANGE[0]},{DEFAULT_LAT_RANGE[1]}")
+                if datetime_range.strip() and not window_ok:
+                    errors.append(f"with study_region, datetime must be empty (the datetime of the region) or a "
+                                  f"closed window start/end, got {datetime_range!r}")
+            return True
 
 
         def check_align_level(errors, value):
@@ -662,10 +774,13 @@ spec:
                 ("platform", platform), ("relative_orbit", relative_orbit),
                 ("absolute_orbit", absolute_orbit), ("datetime", datetime_range),
             ) if value.strip()]
-            if reference_item.strip() and manual:
+            if check_orbit_choice(errors):
+                pass  # lon_range / study_region: the query chooses the orbit
+            elif reference_item.strip() and manual:
                 errors.append(f"reference_item sets the orbit; leave {', '.join(manual)} empty")
-            if not reference_item.strip() and not datetime_range.strip():
-                errors.append("give reference_item, or datetime (+ platform / relative_orbit / absolute_orbit)")
+            elif not reference_item.strip() and not datetime_range.strip():
+                errors.append("give reference_item, datetime (+ platform / relative_orbit / absolute_orbit), "
+                              "lon_range + datetime, or study_region")
             check_int(errors, "relative_orbit", relative_orbit, 1, optional=True)
             check_int(errors, "absolute_orbit", absolute_orbit, 1, optional=True)
             check_int(errors, "max_items", max_items, 1, optional=True)

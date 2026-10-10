@@ -451,7 +451,7 @@ it again. Until #19 is merged, do not apply `argo-values.yaml` from `main`.
 
 The orbit pipeline selects the Sentinel products of one satellite orbit (same
 `sat:absolute_orbit`) in the [CDSE STAC](https://stac.dataspace.copernicus.eu/v1/), cut as a
-latitude band (by default **45.0..49.0 N**, Massif Central to Paris; the preset `france` =
+latitude band (by default **48.0..50.0 N**, around Paris; the preset `france` =
 41.3..51.2 N stays available) over the full swath width, mirrors them as EOPF Zarr (UTM) in
 `s3://grid4earth/public/eopf-mirror/<collection>/`, converts the strip into a single HEALPix Zarr
 in `s3://grid4earth/public/converted/<collection>/` and re-indexes these two categories in the
@@ -498,7 +498,7 @@ run by hand.
 ### Region: latitude band snapped to HEALPix parent cells
 
 The orbit is not cut with a bounding box but as a **latitude band** (`lat_range`, `min,max` in
-degrees, default `45.0,49.0`, or the preset `france` = `41.3,51.2`) over the **full swath width**,
+degrees, default `48.0,50.0`, or the preset `france` = `41.3,51.2`) over the **full swath width**,
 and the band is snapped to HEALPix **parent cells** of `align_level` (nested, WGS84), so that the
 regional products of different orbits line up cell by cell:
 
@@ -532,23 +532,95 @@ default `align_level=7` only fits Sentinel-2 (**use `align_level=6` for Sentinel
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `lat_range` | `45.0,49.0` | latitude band `min,max` or `france` (41.3..51.2); empty or `none` = bounding-box mode (`bbox` is the region, empty = whole orbit, the output is not clipped) |
+| `lat_range` | `48.0,50.0` | latitude band `min,max` or `france` (41.3..51.2); empty or `none` = bounding-box mode (`bbox` is the region, empty = whole orbit, the output is not clipped) |
 | `align_level` | `7` | HEALPix level of the parent cells, 0..11 and not above the chunk level of the settings |
 | `align_rule` | `intersects` | `intersects`: keep the cells that intersect swath and band; `within`: only the cells entirely inside the band (and intersecting the swath) |
 | `bbox` | | in band mode only picks the pass when the orbit crosses the band twice |
 | `region_name` | | last part of the output name, see below |
 
 `align_level=7`, `align_rule=intersects` and keeping the partial cells at the swath edges were
-confirmed for the first target (decision of 10 October 2026). For Sentinel-2C orbit 4025 the
-default band keeps **77 level-7 cells** (one polygon, lat 44.33..49.44, lon -0.77..5.73) and
-**31 of the 44 products** found in the widened band (28 tiles: T30TXQ, T30TYQ and T31TCK have two
-products at a datatake boundary, both are kept; 25.7 GB of SAFE); with `align_rule=within`, 52
-cells (lat 45.12..48.66) and 25 products (22.2 GB). The `france` preset keeps 172 cells (lat
+confirmed for the first target (decision of 10 October 2026); the default band became 48..50 N
+the same day, to halve the conversion. For Sentinel-2C orbit 4025 the default band keeps
+**44 level-7 cells** (one polygon, lat 47.49..50.61, lon 0.00..5.89: the cells add ~0.5 degree
+north and south, so the 2-degree band covers ~3 degrees, 3-4 rows of MGRS tiles) and **23 of the
+25 products** found in the widened band (19.9 GB of SAFE). The former default 45..49 N keeps 77
+cells (lat 44.33..49.44, lon -0.77..5.73) and 31 of 44 products (28 tiles: T30TXQ, T30TYQ and
+T31TCK have two products at a datatake boundary, both are kept; 25.7 GB); with
+`align_rule=within`, 52 cells (lat 45.12..48.66) and 25 products (22.2 GB). The `france` preset keeps 172 cells (lat
 40.75..51.77, lon -2.11..6.86) and 71 of 76 products (55.5 GB); the whole orbit has 489 products
 (347 GB, lat 3.7..82.8). A pass that crosses the antimeridian is not supported (the query stops
 with exit code 2). `legacy-datasets` `safe-to-zarr/download_orbit.py` makes the same selection
-with the same defaults (`--lat-range 45.0,49.0 --align-level 7 --align-rule intersects`;
+with the same defaults (`--lat-range 48.0,50.0 --align-level 7 --align-rule intersects`;
 `--lat-range ""` or `none` for bounding-box mode) and the same output name.
+
+**Choosing the orbit by longitude (`lon_range`).** Instead of `reference_item`, give `lon_range`
+(`min,max` in degrees) and a search window `datetime` (`start/end` of dates or datetimes, e.g.
+`2025-06-08/2025-06-18`; `platform` may limit the satellites). The query then picks **one** orbit
+(decision of 10 October 2026; orbits are never combined):
+
+1. the pass whose valid-data footprints cover the largest part of the box `lon_range` x
+   `lat_range` (areas in an equal-area projection; coverages within 1 % of the box count as equal);
+2. among those, the relative orbit whose swath centre, at the middle latitude of the box, is
+   closest to the middle longitude of the box (Sentinel-2A, 2B and 2C share the tracks);
+3. among the passes of that track, the one closest to `target_date` (`YYYY-MM-DD` or a datetime;
+   empty = middle of the window).
+
+The chosen orbit is then cut as above, over its full swath width, and named as usual (e.g.
+`..._R051_O4025_N48-N50`). The query prints the candidates and the coverage of the box, and
+`extent_info` gets `orbit_choice` (`lon_range`, window, `target_date`, `coverage`,
+`centre_offset_deg` and the first candidates). One orbit may cover the box only in part: a
+Sentinel-2 swath is ~290 km wide but slants by ~1.4 degrees of longitude over 45..49 N, so it holds
+the whole box there only when the box is about 2.4 degrees wide or less. Over France the tracks
+from west to east are R137, R094, R051, R008, R108 (the next track east is 43 relative orbits
+lower and passes 3 days earlier). For example, in the default band 48..50 N and the window
+2025-06-08..2025-06-18, `lon_range=4.5,5.5` gives Sentinel-2A orbit 52086 (R008, 12 June, 100 %),
+and `lon_range=2,5` gives Sentinel-2C orbit 4025 (R051, 98.4 %; the Sentinel-2A and 2B passes of
+R051 cover 98.6 %, within 1 %, and 13 June is closest to `target_date=2025-06-13`). In 45..49 N the
+box 2..5 is covered ~75 % by both R051 and R008, and R051 wins because its centre is closer:
+
+```python
+submit(
+    "orbit-to-healpix-pipeline",
+    lon_range="2,5",
+    datetime="2025-06-08/2025-06-18",
+    target_date="2025-06-13",
+)
+```
+
+**Choosing the orbit for a study region (`study_region`).** Give the id of a region of the
+[GRID4EARTH study-regions](https://github.com/GRID4EARTH/study-regions) registry (read from
+`https://data.grid4earth.eu/regions.geoparquet`, e.g. `paris`, `mont_blanc`, `rostock1`,
+`lake_tuz`) or inline GeoJSON (geometry, Feature or FeatureCollection; its first Feature's
+`properties.id` names the output, else give `region_name`). The query then (decision of 10 October
+2026):
+
+1. keeps only the passes of the window whose valid data cover the **whole** region (99.9 %); when
+   there is none it stops (exit code 2) and prints the best coverage: the region may be wider
+   than one swath (~2.4 degrees of longitude for Sentinel-2 at mid-latitudes) or the window too
+   short;
+2. chooses among them as `lon_range` does: swath centre closest to the middle of the region, then
+   the pass closest to `target_date`;
+3. sets the latitude band from the region: whole degrees, at least **2 degrees** high (about two
+   MGRS tiles of 109.8 km; ~3 degrees and 3-4 tile rows once snapped to the level-7 cells), holding
+   the region, its middle closest to the region's (`lat_range` must stay at its default);
+4. names the output after the region: its id upper-cased, `_` → `-` (`paris` → `PARIS`,
+   `mont_blanc` → `MONT-BLANC`), unless `region_name` is given.
+
+`datetime` defaults to the datetime of the region (a range, or a single date d: d ± 5 days, target
+d); `extent_info.orbit_choice` gets `study_region` (`id`, `name`, `bounds`) and the band. In the
+window 2025-06-08..2025-06-18: `paris` (48.81..48.90 N) → band 48..50, Sentinel-2C orbit 4025 (R051),
+`..._R051_O4025_PARIS` (44 cells, 23 products, as the first target); `mont_blanc` → band 45..47,
+Sentinel-2B orbit 43177 (R108, 12 June; only R108 covers it), `..._R108_O43177_MONT-BLANC`;
+`rostock1` → band 53..55, Sentinel-2C orbit 4039 (R065), `..._R065_O4039_ROSTOCK1`.
+
+```python
+submit(
+    "orbit-to-healpix-pipeline",
+    study_region="paris",
+    datetime="2025-06-08/2025-06-18",
+    target_date="2025-06-13",
+)
+```
 
 **Output name and region tag.** The HEALPix output is
 `converted/<collection>/{platform}_{type}_{first sensing start}_R{relative orbit}_O{absolute orbit}_{region}.zarr`.
@@ -556,10 +628,10 @@ The region tag is `region_name` when given (letters, digits and `-` only, becaus
 split on `_`; upper-cased, except that a name shaped like a band tag keeps a lower-case `p`:
 `n41p3-n51p2` → `N41p3-N51p2`, the tag of that band); otherwise, for a numeric band, the band
 itself: hemisphere letter `N` / `S` and absolute degrees per bound, integers without decimals and
-`p` for the decimal point of the others (`45.0,49.0` → `N45-N49`, `41.3,51.2` → `N41p3-N51p2`,
+`p` for the decimal point of the others (`48.0,50.0` → `N48-N50`, `41.3,51.2` → `N41p3-N51p2`,
 `-12.5,-3` → `S12p5-S3`); `FRANCE` for the `france` preset; in bounding-box mode `FRANCE` for the
-France bbox, else `REGION`. Example:
-`s3://grid4earth/public/converted/sentinel-2-l2a/S2C_MSIL2A_20250613T104641_R051_O4025_N45-N49.zarr`.
+France bbox, else `REGION`; for a study region its id (see below). Example:
+`s3://grid4earth/public/converted/sentinel-2-l2a/S2C_MSIL2A_20250613T104641_R051_O4025_N48-N50.zarr`.
 
 ### CDSE credentials
 
@@ -716,11 +788,11 @@ recent()                   # the latest workflows, if the name was lost
 Other parameters of a template are further keyword arguments of `submit` (`name=value` in this
 README).
 
-### First target: Sentinel-2C orbit 4025, 45.0..49.0 N, every group
+### First target: Sentinel-2C orbit 4025, 48.0..50.0 N, every group
 
 The first production run (decision of 10 October 2026) is relative orbit 51, absolute orbit 4025
 of Sentinel-2C (13 June 2025), identified by one of its products, with the defaults: latitude band
-45.0..49.0 N, full swath width, level-7 parent cells, `align_rule=intersects`, partial east / west
+48.0..50.0 N (45.0..49.0 N at first, narrowed the same day to halve the conversion), full swath width, level-7 parent cells, `align_rule=intersects`, partial east / west
 edge cells kept, **all conversion groups** (`groups` empty):
 
 ```python
@@ -730,9 +802,11 @@ submit(
 )
 ```
 
-The 31 products of the band region are mirrored in `s3://grid4earth/public/eopf-mirror/sentinel-2-l2a/`
+The 23 products of the band region are mirrored in `s3://grid4earth/public/eopf-mirror/sentinel-2-l2a/`
 and the HEALPix result is written to
-`s3://grid4earth/public/converted/sentinel-2-l2a/S2C_MSIL2A_20250613T104641_R051_O4025_N45-N49.zarr`.
+`s3://grid4earth/public/converted/sentinel-2-l2a/S2C_MSIL2A_20250613T104641_R051_O4025_N48-N50.zarr`.
+`study_region="paris"` (below) picks the same orbit and band for the 13 June window and names the
+output `..._R051_O4025_PARIS.zarr`.
 Before it, the bounding-box test below checks the image, the secrets and the cluster on 2
 products, and `stac-scraper-update` with `dry_run=true` on the two categories finds index
 problems that would otherwise only stop the run after the conversion (see "STAC index").
@@ -744,6 +818,9 @@ described in the template):
 |---|---|---|
 | `collection` | `sentinel-2-l2a` | CDSE collection (`sentinel-2-l1c`, `sentinel-2-l2a`, `sentinel-3-olci-1-efr-ntc`, `sentinel-3-sl-1-rbt-ntc`, ...) |
 | `reference_item` | | one CDSE product of the orbit; otherwise give `datetime` (and `platform`, `absolute_orbit`, `relative_orbit`), not both |
+| `lon_range` | | `min,max`: choose one orbit in the `datetime` window by its coverage of `lon_range` x `lat_range` (see above); leave `reference_item`, `relative_orbit` and `absolute_orbit` empty |
+| `study_region` | | id of a study region (e.g. `paris`) or inline GeoJSON: choose one orbit that covers the whole region; sets the band (>= 2 degrees) and the output name (`PARIS`), see above |
+| `target_date` | | with `lon_range` / `study_region`: among passes of equal coverage on the same track, the one closest to this date (empty = middle of `datetime`, or the date of the study region) |
 | `check_sample_service` | `true` | copy the products from the EOPF Sample Service when it has every product of the orbit (stores from both sources cannot be merged into one HEALPix dataset) |
 | `settings_name` | `sentinel-2-l2a` | `legacy_converters` settings, named after the G4E collection: it **must match** `collection` (empty = derived from it); the run stops at the argument check otherwise |
 | `groups` | all | JSON list of groups to convert, e.g. `'["measurements/reflectance/r60m"]'` |
@@ -769,8 +846,9 @@ submit(
 ```
 
 which writes
-`s3://grid4earth/public/converted/sentinel-3-olci-l1-efr/S3B_OL_1_EFR_20250613T111915_R308_O37155_N45-N49.zarr`
-(1 product, 86 level-6 cells, lon -25.1..-3.3: this pass lies west of France; with
+`s3://grid4earth/public/converted/sentinel-3-olci-l1-efr/S3B_OL_1_EFR_20250613T111615_R308_O37155_N48-N50.zarr`
+(2 products, 61 level-6 cells, lon -24.5..-3.3: this pass lies west of France; in 45..49 N it
+had 1 product and 86 cells; with
 `lat_range=france` it has 3 products and 173 cells and is named `..._FRANCE.zarr`). The STAC
 update of `eopf-mirror/sentinel-3-olci-l1-efr` works because the template leaves the second copy
 of an older OLCI product out of the index (see `exclude_stores` below).
@@ -795,7 +873,8 @@ submit(
 
 ### Scale, wall time and bottlenecks
 
-Measured for the first target (orbit 4025, 45.0..49.0 N, level 7): 77 cells, 31 products (28
+Measured for the first target in its first band (orbit 4025, 45.0..49.0 N, level 7; the default
+band 48..50 N has 44 cells, 23 products and 11 264 chunks per group, 57 % of it): 77 cells, 31 products (28
 tiles), 25.7 GB of SAFE; 19 712 level-11 output chunks per chunked group in the extent, 15 609 of
 which hold data (by the footprints of the 31 products; 503 of them cross the edge of the data).
 Converting one chunk of all 16 chunked Sentinel-2 L2A groups takes 13.3 s locally with 4 threads
@@ -948,8 +1027,8 @@ Exit code 2 (invalid arguments or data, duplicated ids, missing credentials) is 
   `converted-sentinel-2-l2a`) are replaced in place or appended, every other entry is kept as it
   is, and nothing is ever removed. A diff (added / replaced / kept) is printed.
 - **Item ids.** The ids that eopf (3.0 / rc4) gives the tiles of one Sentinel-2 datatake differ
-  only by a 3-hex-digit CRC (4096 values): the chance of a duplicate is about 11 % among the 31
-  products of the first target (45.0..49.0 N) and 46 % among the 71 of the `france` preset, and
+  only by a 3-hex-digit CRC (4096 values): the chance of a duplicate is about 6 % among the 23
+  products of the first target (48.0..50.0 N; 11 % among the 31 of 45.0..49.0 N) and 46 % among the 71 of the `france` preset, and
   the STAC API answers 404 for every item of a duplicated id. `mirror-item` therefore sets the `stac_discovery` id of each new store to the
   product name (the store name without `.zarr` / `.SEN3` / `.SAFE`, e.g.
   `S2C_MSIL2A_20250613T104641_N0511_R051_T31UDQ_20250613T134507`, the id stac-scraper's
