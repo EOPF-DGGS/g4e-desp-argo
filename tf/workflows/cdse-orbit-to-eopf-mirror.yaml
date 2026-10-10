@@ -2,24 +2,85 @@
 # over a region into s3://grid4earth/public/eopf-mirror/<collection>/ as EOPF Zarr.
 #
 #   query        CDSE STAC search (+ optional EOPF Sample Service lookup); outputs
-#                the item list and the names used by the HEALPix step.
+#                the item list and the names and extent used by the HEALPix step.
 #   mirror-item  one pod per product: copy the Sample Service Zarr if there is one,
 #                else download the SAFE zip from CDSE and convert it with eopf.
 #                Complete stores (root zarr.json with stac_discovery) are skipped.
+#                The STAC id (stac_discovery.id) of a new store is its product
+#                name (see "Item ids" below).
+#
+# Region (lat_range, default "45.0,49.0" = 45..49 N, Massif Central to Paris; the
+# preset "france" = 41.3..51.2 stays available): the orbit is cut as a LATITUDE
+# BAND over the full swath width, snapped to HEALPix parent cells (align_level,
+# nested, WGS84) so that later regional products line up:
+#   1. search the orbit in the band widened by 2 align_level cells and group the
+#      footprints into passes: connected parts, joined when their sensing times
+#      are within 5 min and their longitudes overlap (a gap along the track, e.g.
+#      a missing row of tiles, does not split a pass). The orbit may cross the
+#      band twice (day / night halves, SLSTR): keep the pass of the reference
+#      item (manual mode: the pass that intersects bbox; bbox is required when
+#      there are several);
+#   2. S = union of the footprints of that pass, cut to the band;
+#   3. align_level cells over S.bounds, kept when the cell intersects S
+#      (align_rule=intersects) or, with align_rule=within, when it also lies
+#      entirely inside the band; partial cells at the swath edges are kept;
+#   4. region = union of the kept cells: ONE polygon (healpix-convert refuses a
+#      MultiPolygon; holes, i.e. gaps in the swath, are filled and their cells
+#      counted as kept);
+#   5. products = the products of the pass whose footprint intersects the region.
+# Outputs: output_extent = the region as a compact GeoJSON Polygon drawn through
+# the cell corners and moved 1e-5 deg inwards, so that healpix-convert (healpix_geo
+# polygon_coverage, which joins the vertices with great-circle arcs and also
+# returns the cells that only touch the polygon) converts the chunks inside the
+# kept cells. This is checked at level 11 (the Sentinel-2 chunk level; coarser
+# levels follow) when that is at most 4**11 cells, and stage-cache compares the
+# chunk count of every group with n_cells; both print a WARNING on a mismatch.
+# Exact in every case tried with align_level 6 or 7; with align_level <= 5 near the
+# poles chunks along the edges of the kept cells can be lost (warned).
+# extent_info = JSON {mode: band, lat_range, align_level, align_rule, ellipsoid,
+# indexing_scheme, n_cells, lat/lon_min/max_actual}.
+# With lat_range "" (or "none") the region is bbox (minx,miny,maxx,maxy or
+# "france"; empty = whole orbit), output_extent is "" and extent_info {mode: bbox
+# or orbit, bbox}.
+# In band mode bbox only picks the pass.
+#
+# Region tag (last part of healpix_name, {platform}_{type}_{first sensing start}_
+# R{relative orbit}_O{absolute orbit}_{region}): an explicit region_name always
+# wins (upper-cased, except the "p" of a name shaped like a band tag, so that
+# region_name=n41p3-n51p2 gives N41p3-N51p2 as the band itself would); else the
+# lat_range preset name (france -> FRANCE); else, for
+# a numeric band, the band itself: hemisphere letter N / S and absolute degrees per
+# bound, integers without decimals and the decimal point of the others written
+# "p" (45.0,49.0 -> N45-N49; 41.3,51.2 -> N41p3-N51p2; -12.5,-3 -> S12p5-S3);
+# without lat_range the bbox preset (FRANCE) or REGION. The tag may only hold
+# letters, digits and "-" (the name is split on "_").
 #
 # Sample Service: its stores and the eopf conversions of the CDSE SAFE carry
 # different STAC metadata (stac_extensions versions), which healpix-convert cannot
 # merge into one HEALPix dataset. The Sample Service is therefore used only when it
 # has EVERY product of the orbit; otherwise everything comes from CDSE.
 #
+# Item ids: eopf (3.0 / rc4) gives every tile of one Sentinel-2 datatake the same
+# id except for a 3-hex-digit CRC (4096 values), e.g. S02MSIL2A_20250613T104641_0000_C051_T266:
+# among the 71 products of the France run (lat_range=france) of orbit 4025 the
+# chance of a duplicate is about 46 % (31 products of the default band 45..49 N:
+# about 11 %), and the STAC API answers 404 for every item of a duplicated id
+# (stac-scraper-update then stops). mirror-item therefore sets the
+# stac_discovery.id of the store it uploads to the product name: the store name
+# without .zarr and without a .SEN3 / .SAFE suffix, e.g.
+# S2C_MSIL2A_20250613T104641_N0511_R051_T31UDQ_20250613T134507, the id that
+# stac-scraper --id-from-store-name (stac-scraper PR #24) gives. The eopf id is
+# kept in the root attribute g4e_mirror.eopf_stac_id. Stores mirrored before
+# keep their eopf id (complete stores are skipped).
+#
 # CDSE allows 4 concurrent connections per account: the DAG runs at most 4
 # mirror pods (do not run legacy-datasets download_orbit.py with the same account
 # at the same time), and HTTP 429/503 answers wait for Retry-After.
 #
 # The DAG template 'main' takes every argument as an input parameter and exposes
-# mirror_paths / orbit / healpix_output_path / healpix_name as outputs, so another
-# WorkflowTemplate can call it with templateRef {name: cdse-orbit-to-eopf-mirror,
-# template: main}.
+# mirror_paths / orbit / healpix_output_path / healpix_name / output_extent /
+# extent_info as outputs, so another WorkflowTemplate can call it with
+# templateRef {name: cdse-orbit-to-eopf-mirror, template: main}.
 #
 # Secrets: argo-s3-credentials (accessKey, secretKey) and argo-cdse-credentials
 # (username, password: a Copernicus Data Space Ecosystem account). The CDSE secret
@@ -55,12 +116,22 @@ spec:
       - name: datetime
         value: ""
         description: manual mode, STAC datetime range start/end
+      - name: lat_range
+        value: "45.0,49.0"
+        description: latitude band min,max (deg, default 45..49 N) or the preset "france" (41.3,51.2), cut over the full swath width and snapped to align_level cells; empty (or "none") = use bbox
+      - name: align_level
+        value: "7"
+        description: HEALPix level (nested, WGS84) of the parent cells the band is snapped to, 0..11 (not above the chunk level of the conversion settings)
+      - name: align_rule
+        value: intersects
+        enum: ["intersects", "within"]
+        description: keep a cell that intersects swath and band (intersects) or only cells entirely inside the band (within)
       - name: bbox
-        value: "-5.3,41.3,9.6,51.2"
-        description: minx,miny,maxx,maxy or the preset name "france" (empty = whole orbit)
+        value: ""
+        description: minx,miny,maxx,maxy or the preset "france"; with lat_range it only picks the pass when the orbit crosses the band twice; without lat_range it is the region (empty = whole orbit)
       - name: region_name
         value: ""
-        description: last part of the HEALPix output name; empty = FRANCE for the France bbox, else REGION
+        description: last part of the HEALPix output name (letters, digits and '-', upper-cased; the 'p' of a band-shaped name stays lower case); empty = the band tag (lat_range 45.0,49.0 -> N45-N49, 41.3,... -> N41p3-...), FRANCE for lat_range "france" (or, without lat_range, the France bbox), else REGION
       - name: mirror_prefix
         value: s3://grid4earth/public/eopf-mirror
       - name: converted_prefix
@@ -90,6 +161,9 @@ spec:
         - name: relative_orbit
         - name: absolute_orbit
         - name: datetime
+        - name: lat_range
+        - name: align_level
+        - name: align_rule
         - name: bbox
         - name: region_name
         - name: mirror_prefix
@@ -125,6 +199,12 @@ spec:
                 value: "{{inputs.parameters.absolute_orbit}}"
               - name: datetime
                 value: "{{inputs.parameters.datetime}}"
+              - name: lat_range
+                value: "{{inputs.parameters.lat_range}}"
+              - name: align_level
+                value: "{{inputs.parameters.align_level}}"
+              - name: align_rule
+                value: "{{inputs.parameters.align_rule}}"
               - name: bbox
                 value: "{{inputs.parameters.bbox}}"
               - name: region_name
@@ -165,6 +245,14 @@ spec:
         - name: healpix_name
           valueFrom:
             parameter: "{{tasks.query.outputs.parameters.healpix_name}}"
+        # GeoJSON Polygon of the region in band mode, "" otherwise
+        - name: output_extent
+          valueFrom:
+            parameter: "{{tasks.query.outputs.parameters.output_extent}}"
+        # JSON: how the region was built (mode band / bbox / orbit)
+        - name: extent_info
+          valueFrom:
+            parameter: "{{tasks.query.outputs.parameters.extent_info}}"
 
   - name: query
     inputs:
@@ -175,6 +263,9 @@ spec:
         - name: relative_orbit
         - name: absolute_orbit
         - name: datetime
+        - name: lat_range
+        - name: align_level
+        - name: align_rule
         - name: bbox
         - name: region_name
         - name: mirror_prefix
@@ -199,6 +290,12 @@ spec:
         - name: healpix_output_path
           valueFrom:
             path: /tmp/out/healpix_output_path.txt
+        - name: output_extent
+          valueFrom:
+            path: /tmp/out/output_extent.json
+        - name: extent_info
+          valueFrom:
+            path: /tmp/out/extent_info.json
     retryStrategy:
       limit: "2"
       retryPolicy: Always
@@ -235,6 +332,8 @@ spec:
             sat:relative_orbit where the collection allows them, then filter
             sat:absolute_orbit (and platform / relative orbit) client-side;
           * fail unless exactly one absolute orbit remains;
+          * band mode (lat_range set): cut the orbit as a latitude band over the full
+            swath width, snapped to HEALPix cells of align_level (select_band);
           * optionally find each product on the EOPF Sample Service (one search over
             the whole orbit): same id first, else same sensing (S2: id without the
             processing time; S3: sensing start/stop, timeliness and baseline) within
@@ -242,6 +341,7 @@ spec:
             has every product of the orbit.
         """
         import json
+        import math
         import os
         import posixpath
         import re
@@ -258,6 +358,9 @@ spec:
         relative_orbit = "{{inputs.parameters.relative_orbit}}"
         absolute_orbit = "{{inputs.parameters.absolute_orbit}}"
         datetime_range = "{{inputs.parameters.datetime}}"
+        lat_range = "{{inputs.parameters.lat_range}}"
+        align_level = "{{inputs.parameters.align_level}}"
+        align_rule = "{{inputs.parameters.align_rule}}"
         bbox = "{{inputs.parameters.bbox}}"
         region_name = "{{inputs.parameters.region_name}}"
         mirror_prefix = "{{inputs.parameters.mirror_prefix}}"
@@ -274,7 +377,44 @@ spec:
         # named regions accepted by bbox; a bbox equal to a preset names the output
         # after it (as legacy-datasets download_orbit.py --bbox france)
         BBOX_PRESETS = {"france": (-5.3, 41.3, 9.6, 51.2)}
+        # named latitude bands accepted by lat_range; the preset NAME names the output
+        # (france -> FRANCE), explicit numbers give the band tag (band_tag)
+        LAT_RANGE_PRESETS = {"france": (41.3, 51.2)}
         DEFAULT_REGION_NAME = "REGION"
+        REGION_TAG = re.compile(r"[A-Za-z0-9-]+")  # the HEALPix name is split on "_"
+        # an explicit region_name of this shape keeps the lower-case "p" of band_tag
+        BAND_TAG = re.compile(r"[NS]\d+(?:P\d+)?-[NS]\d+(?:P\d+)?")
+        LAT_RANGE_OFF = ("", "none")  # lat_range values that select bbox mode
+        # band mode: HEALPix grid of the parent cells (that of the conversion settings)
+        HEALPIX_ELLIPSOID = "WGS84"
+        HEALPIX_INDEXING = "nested"
+        # align_level must not exceed the chunk level of the conversion settings
+        # (S2: 11): healpix-convert clips the output per chunk, not per cell
+        MAX_ALIGN_LEVEL = 11
+        ALIGN_RULES = ("intersects", "within")
+        VERTEX_STEP = 4  # vertices per cell side for the cell tests: cell edges are curves in lon/lat
+        # output_extent is the union of the kept cells drawn through their CORNERS only:
+        # healpix-convert gives its vertices to healpix_geo polygon_coverage, which joins
+        # them with great-circle arcs like its own cell model, and moved EXTENT_INSET deg
+        # inwards, because polygon_coverage also returns the cells that only touch the
+        # polygon. Then the chunks inside the kept cells are converted (the densified
+        # union instead adds a ring of outside chunks). Checked at CHECK_LEVEL, the
+        # finest chunk level of the settings (S2), where a chunk lost or added along a
+        # cell edge shows first, when the kept cells have at most CHECK_MAX_CELLS
+        # children there (else at the finest level below that does).
+        EXTENT_INSET = 1e-5
+        CHECK_LEVEL = MAX_ALIGN_LEVEL
+        CHECK_MAX_CELLS = 4**11
+        # footprints closer than this (deg) belong to the same pass over the band
+        COMPONENT_TOLERANCE = 0.01
+        # parts of the footprints whose sensing times are closer than this and whose
+        # longitudes overlap belong to the same pass: the products of one pass follow each
+        # other (S3: 3-min products; S2: every tile carries its datatake start), while the
+        # two crossings of a latitude band by one orbit (ascending / descending) lie far
+        # apart in longitude (and, below ~65 deg, at least ~15 min apart)
+        PASS_TIME_GAP = timedelta(minutes=5)
+        EXTENT_DECIMALS = 7  # output_extent coordinates (~1 cm)
+        HTTP_TIMEOUT = (60, 600)  # requests (connect, read) timeouts, s: slow links
         S3_TIMELINESS = re.compile(r"_(NR|NT|ST)_(\d{3})(?:\.SEN3)?$")
 
         # CDSE collection id -> G4E (and EOPF Sample Service) collection id
@@ -332,16 +472,79 @@ spec:
             return parts, None
 
 
-        def resolve_region_name(value, preset):
-            """region_name, else the bbox preset (FRANCE), else REGION.
+        def parse_lat_range(value):
+            """(lat_range, preset name) from "min,max" or a preset name; (None, None) when empty
+            or "none" (bbox mode)."""
+            text = value.strip()
+            if text.lower() in LAT_RANGE_OFF:
+                return None, None
+            if text.lower() in LAT_RANGE_PRESETS:
+                return list(LAT_RANGE_PRESETS[text.lower()]), text.lower()
+            try:
+                parts = [float(v) for v in text.split(",")]
+            except ValueError:
+                parts = []
+            if len(parts) != 2:
+                fail(f"lat_range must be min,max, one of {sorted(LAT_RANGE_PRESETS)} or empty / 'none' "
+                     f"(bbox mode), got {value!r}")
+            if not -90 <= parts[0] < parts[1] <= 90:
+                fail(f"lat_range needs -90 <= min < max <= 90, got {value!r}")
+            return parts, None
 
-            Same rule as legacy-datasets download_orbit.resolve_region_name. The
-            name is split on "_": only letters, digits and "-", upper-cased.
+
+        def parse_align_level(value):
+            level = parse_int("align_level", value)
+            if level is None or not 0 <= level <= MAX_ALIGN_LEVEL:
+                fail(f"align_level must be an integer in [0, {MAX_ALIGN_LEVEL}], got {value!r}")
+            return level
+
+
+        def parse_align_rule(value):
+            rule = value.strip().lower()
+            if rule not in ALIGN_RULES:
+                fail(f"align_rule must be one of {list(ALIGN_RULES)}, got {value!r}")
+            return rule
+
+
+        def band_tag(lat_min, lat_max):
+            """Region tag of a numeric latitude band: hemisphere letter + absolute degrees
+            per bound, "p" for the decimal point: 45.0,49.0 -> N45-N49, 41.3,51.2 ->
+            N41p3-N51p2, -12.5,-3 -> S12p5-S3 (0 is N)."""
+            from decimal import Decimal
+
+            def bound(value):
+                text = format(Decimal(repr(abs(value))), "f")  # positional, no exponent
+                if "." in text:
+                    text = text.rstrip("0").rstrip(".")
+                return ("S" if value < 0 else "N") + text.replace(".", "p")
+
+            return f"{bound(lat_min)}-{bound(lat_max)}"
+
+
+        def resolve_region_name(value, lat_band, lat_preset, bbox_preset):
+            """Last part of the HEALPix name, see "Region tag" in the template header.
+
+            An explicit region_name wins (upper-cased; a name shaped like a band tag keeps
+            a lower-case "p": n41p3-n51p2 -> N41p3-N51p2, as band_tag writes it); band
+            mode: the lat_range preset (FRANCE), else the band tag (N45-N49, kept as is:
+            "p" stays lower case); bbox mode: the bbox preset (FRANCE), else REGION. Same
+            rule as legacy-datasets download_orbit.resolve_region_name.
             """
-            name = value.strip() or (preset.upper() if preset else DEFAULT_REGION_NAME)
-            if not re.fullmatch(r"[A-Za-z0-9-]+", name):
-                fail(f"region_name may only contain letters, digits and '-', got {value!r}")
-            return name.upper()
+            name = value.strip()
+            if name:
+                source = "region_name"
+            elif lat_band:
+                name = lat_preset.upper() if lat_preset else band_tag(*lat_band)
+                source = "lat_range"
+            else:
+                name = bbox_preset.upper() if bbox_preset else DEFAULT_REGION_NAME
+                source = "bbox"
+            if not REGION_TAG.fullmatch(name):
+                fail(f"the region tag from {source} may only contain letters, digits and '-', got {name!r}")
+            if source != "region_name":
+                return name
+            name = name.upper()
+            return name.replace("P", "p") if BAND_TAG.fullmatch(name) else name
 
 
         def write_output(name, text):
@@ -352,24 +555,29 @@ spec:
 
         def open_client(url):
             """STAC client that retries 429 / 5xx with backoff (the CDSE WAF rate-limits;
-            pystac-client's default retries neither 429 nor POST /search)."""
+            pystac-client's default retries neither 429 nor POST /search), with
+            HTTP_TIMEOUT on every request (no timeout by default)."""
             try:
                 from pystac_client.stac_api_io import StacApiIO
                 from urllib3.util.retry import Retry
-
-                retry = Retry(total=6, backoff_factor=5, status_forcelist=(429, 500, 502, 503, 504),
-                              allowed_methods=None, respect_retry_after_header=True,
-                              raise_on_status=False)
-                return pystac_client.Client.open(url, stac_io=StacApiIO(max_retries=retry))
-            except (ImportError, TypeError):  # older pystac-client: no max_retries
+            except ImportError:
                 return pystac_client.Client.open(url)
+            retry = Retry(total=6, backoff_factor=5, status_forcelist=(429, 500, 502, 503, 504),
+                          allowed_methods=None, respect_retry_after_header=True,
+                          raise_on_status=False)
+            for kwargs in (dict(max_retries=retry, timeout=HTTP_TIMEOUT), dict(max_retries=retry)):
+                try:
+                    return pystac_client.Client.open(url, stac_io=StacApiIO(**kwargs))
+                except TypeError:  # older pystac-client: no timeout / max_retries
+                    continue
+            return pystac_client.Client.open(url)
 
 
         def server_queryables(coll):
             """Properties the CDSE collection accepts in a CQL2 filter."""
             url = f"{CDSE_STAC_URL.rstrip('/')}/collections/{coll}/queryables"
             try:
-                with urllib.request.urlopen(url, timeout=60) as response:
+                with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT[1]) as response:
                     return set(json.load(response).get("properties", {}))
             except Exception as exc:
                 print(f"warning: cannot read {url} ({exc}); filtering client-side only")
@@ -522,13 +730,280 @@ spec:
             return hrefs
 
 
+        # ---- band mode -------------------------------------------------------------------
+        def sensing_span(item):
+            """(start, end) of an item: start_/end_datetime, else datetime (S2: the datatake
+            start, shared by every tile of the datatake)."""
+            p = item.properties
+            return (parse_dt(p.get("start_datetime") or p["datetime"]),
+                    parse_dt(p.get("end_datetime") or p["datetime"]))
+
+
+        def join_split_passes(groups, spans, lons):
+            """Join groups of item ids that are one pass cut by a gap along the track: their
+            sensing time ranges are within PASS_TIME_GAP and their longitude ranges overlap
+            (the two crossings of a band lie far apart in longitude)."""
+            groups = [set(g) for g in groups]
+
+            def span(ids):
+                return min(spans[k][0] for k in ids), max(spans[k][1] for k in ids)
+
+            def lon_range(ids):
+                return min(lons[k][0] for k in ids), max(lons[k][1] for k in ids)
+
+            joined = True
+            while joined:
+                joined = False
+                for a in range(len(groups)):
+                    for b in range(a + 1, len(groups)):
+                        (s0, e0), (s1, e1) = span(groups[a]), span(groups[b])
+                        (x0, x1), (x2, x3) = lon_range(groups[a]), lon_range(groups[b])
+                        if max(s0, s1) - min(e0, e1) <= PASS_TIME_GAP and x0 <= x3 and x2 <= x1:
+                            groups[a] |= groups.pop(b)
+                            joined = True
+                            break
+                    if joined:
+                        break
+            return groups
+
+
+        def cell_size_deg(level):
+            """Angular size (deg) of a HEALPix cell: sqrt(4 pi / (12 * 4**level)) rad."""
+            return math.degrees(math.sqrt(math.pi / 3)) / 2**level
+
+
+        def band_search_bbox(lat_band, level):
+            """Search bbox of band mode: the band over all longitudes, widened by 2 cells so
+            that the products under the cells that stick out of the band are found."""
+            margin = 2 * cell_size_deg(level)
+            return [-180.0, max(-90.0, lat_band[0] - margin), 180.0, min(90.0, lat_band[1] + margin)]
+
+
+        def footprint(item):
+            from shapely.geometry import box, shape
+
+            geom = shape(item.geometry) if item.geometry else box(*item.bbox)
+            if not geom.is_valid:
+                geom = geom.buffer(0)
+            return geom
+
+
+        def cell_polygons(cells, level, hpx_nested, step):
+            """Shapely polygons (lon -180..180) of HEALPix cells with `step` vertices per
+            side (1 = the 4 corners), and the latitudes of their vertices."""
+            import numpy as np
+            from shapely.geometry import Polygon
+
+            lon, lat = hpx_nested.vertices(cells, level, ellipsoid=HEALPIX_ELLIPSOID, step=step)
+            lon = np.asarray(lon, dtype="float64").reshape(len(cells), -1)
+            lat = np.asarray(lat, dtype="float64").reshape(len(cells), -1)
+            lon = (lon + 180.0) % 360.0 - 180.0  # healpix_geo returns 0..360
+            wraps = lon.max(axis=1) - lon.min(axis=1) > 180.0  # cell across the antimeridian
+            lon[wraps] = np.where(lon[wraps] < 0, lon[wraps] + 360.0, lon[wraps])
+            # neighbouring cells get bit-identical shared vertices, so that the union of
+            # the kept cells has no slivers
+            lon, lat = np.round(lon, 9), np.round(lat, 9)
+            return [Polygon(np.column_stack([x, y])) for x, y in zip(lon, lat)], lat
+
+
+        def select_band(items, ref_id, bbox_list, lat_band, level, rule):
+            """(items, output_extent, extent_info) of band mode, see the template header.
+
+            items: the products of ONE absolute orbit found in band_search_bbox.
+            """
+            import numpy as np
+            from shapely.geometry import Polygon, box
+            from shapely.geometry.polygon import orient
+            from shapely.ops import unary_union
+            from shapely.prepared import prep
+
+            try:
+                import healpix_geo.nested as hpx_nested  # only needed in band mode
+            except ImportError as exc:
+                fail(f"band mode (lat_range) needs healpix-geo in healpix_image: {exc}")
+
+            lat_min, lat_max = lat_band
+            band = box(-180.0, lat_min, 180.0, lat_max)
+            search = box(*band_search_bbox(lat_band, level))
+            feet = {i.id: footprint(i) for i in items}
+
+            # 1. passes over the band: connected parts of the footprints in the search band
+            #    (an orbit crosses a latitude twice, day and night halves), joined when their
+            #    sensing times are close and their longitudes overlap (a gap along the track
+            #    must not split a pass)
+            clipped = {k: g.intersection(search) for k, g in feet.items()}
+            clipped = {k: g for k, g in clipped.items() if not g.is_empty}
+            merged = unary_union([g.buffer(COMPONENT_TOLERANCE) for g in clipped.values()])
+            groups = []
+            for part in getattr(merged, "geoms", [merged]):
+                ids = {k for k, g in clipped.items() if part.intersects(g)}
+                # a footprint split at the antimeridian (MultiPolygon) joins its two sides
+                for other in [g for g in groups if g & ids]:
+                    groups.remove(other)
+                    ids |= other
+                if ids:
+                    groups.append(ids)
+            groups = join_split_passes(groups, {i.id: sensing_span(i) for i in items},
+                                       {k: (g.bounds[0], g.bounds[2]) for k, g in clipped.items()})
+            start = {i.id: (parse_dt(i.properties["datetime"]), i.id) for i in items}
+            passes = []
+            for ids in sorted(groups, key=lambda g: min(start[k] for k in g)):
+                swath = unary_union([clipped[k] for k in ids]).intersection(band)
+                if swath.area > 0:
+                    passes.append({"ids": ids, "swath": swath})
+            if not passes:
+                fail(f"no product of the orbit covers the latitude band {lat_min}..{lat_max}")
+            for n, p in enumerate(passes):
+                x0, y0, x1, y1 = p["swath"].bounds
+                t0 = min(start[k] for k in p["ids"])[0]
+                print(f"pass {n}: {len(p['ids'])} products from {t0:%Y-%m-%dT%H:%M:%S}, band part "
+                      f"lon {x0:.3f}..{x1:.3f} lat {y0:.3f}..{y1:.3f}")
+
+            chosen = [p for p in passes if ref_id in p["ids"]] if ref_id else []
+            if ref_id and not chosen:
+                print(f"note: the reference item {ref_id} is outside the latitude band; "
+                      "the pass is chosen with bbox")
+            if not chosen and bbox_list:
+                area = box(*bbox_list)
+                chosen = [p for p in passes if p["swath"].intersects(area)]
+                if not chosen:
+                    fail(f"bbox {bbox_list} intersects none of the {len(passes)} passes of the orbit "
+                         f"over the latitude band")
+            elif not chosen:
+                chosen = passes
+            if len(chosen) > 1:
+                fail(f"the orbit crosses the latitude band {len(chosen)} times (passes listed above); "
+                     "set bbox to a box that intersects only the wanted pass")
+            swath = chosen[0]["swath"]
+            for n, p in enumerate(passes):
+                if p is chosen[0]:
+                    continue
+                x0, _, x1, _ = p["swath"].bounds
+                if x0 <= swath.bounds[2] and x1 >= swath.bounds[0]:
+                    # the two crossings of a band lie far apart in longitude; one beside or
+                    # below the chosen pass is more likely the same pass cut by a gap
+                    print(f"WARNING: pass {n} ({len(p['ids'])} products) is left out although it "
+                          "overlaps the chosen pass in longitude: a gap along the track?")
+                else:
+                    print(f"note: pass {n} ({len(p['ids'])} products) is left out")
+            if swath.bounds[0] <= -180 + 1e-9 or swath.bounds[2] >= 180 - 1e-9:
+                fail("the pass crosses the antimeridian: not supported (healpix-convert needs one "
+                     "polygon in lon -180..180)")
+
+            # 2./3. cells of align_level over the swath
+            cover = hpx_nested.zone_coverage(tuple(swath.bounds), level, ellipsoid=HEALPIX_ELLIPSOID,
+                                             flat=True)
+            cells = np.unique(np.asarray(cover[0] if isinstance(cover, tuple) else cover, dtype="uint64"))
+            polygons, vertex_lats = cell_polygons(cells, level, hpx_nested, VERTEX_STEP)
+            test = prep(swath)
+            keep = np.array([
+                (rule == "intersects" or (lats.min() >= lat_min - 1e-9 and lats.max() <= lat_max + 1e-9))
+                and test.intersects(poly)
+                for poly, lats in zip(polygons, vertex_lats)
+            ], dtype=bool)
+            if not keep.any():
+                fail(f"no level-{level} cell kept with align_rule={rule} (band too narrow for "
+                     "'within'? lower align_level or use 'intersects')")
+            kept = cells[keep]
+
+            # 4. region = union of the kept cells, ONE polygon; healpix-convert reads one
+            #    ring only (shapely.get_coordinates), so holes (gaps in the swath, no input
+            #    data there) are filled
+            def one_polygon(geom):
+                if geom.geom_type != "Polygon":
+                    parts = [tuple(round(v, 3) for v in g.bounds) for g in getattr(geom, "geoms", [])]
+                    fail(f"the {len(kept)} kept level-{level} cells form a {geom.geom_type} of "
+                         f"{len(parts)} parts (bounds {parts}); healpix-convert needs one polygon "
+                         "(a gap along the track wider than a cell?)")
+                return Polygon(geom.exterior)
+
+            union = unary_union([p for p, k in zip(polygons, keep) if k])
+            region = one_polygon(union)
+            # the cells in the holes are converted too (output_extent has no holes): count
+            # them as kept, so that n_cells and the checks below match what is converted
+            inside = prep(region)
+            filled = np.array([not k and inside.contains(p.representative_point())
+                               for p, k in zip(polygons, keep)], dtype=bool)
+            if filled.any():
+                keep |= filled
+                kept = cells[keep]
+                print(f"note: the holes of the region (gaps in the swath) are filled: "
+                      f"{int(filled.sum())} more level-{level} cells")
+            if not box(*band_search_bbox(lat_band, level)).contains(region):
+                fail("the region sticks out of the search band; products may be missing")
+
+            # output_extent: the same cells through their corners, EXTENT_INSET inwards
+            corners, _ = cell_polygons(kept, level, hpx_nested, 1)
+            extent = one_polygon(unary_union(corners)).buffer(-EXTENT_INSET, join_style="mitre")
+            if extent.geom_type != "Polygon" or extent.is_empty:
+                fail(f"output_extent is a {extent.geom_type} after the {EXTENT_INSET} deg inset")
+            extent = orient(extent, 1.0)  # counter-clockwise exterior (RFC 7946)
+            ring = [[round(x, EXTENT_DECIMALS), round(y, EXTENT_DECIMALS)] for x, y in extent.exterior.coords]
+            geojson = {"type": "Polygon", "coordinates": [ring]}
+            rounded = Polygon(ring)
+            if not rounded.is_valid:
+                from shapely.validation import explain_validity
+
+                fail(f"output_extent is invalid after rounding: {explain_validity(rounded)}")
+            # the cells healpix-convert derives from it (compute_output_chunk_info): at the
+            # finest affordable level up to CHECK_LEVEL, against the children of the kept cells
+            check_level = level
+            while (check_level < CHECK_LEVEL
+                   and kept.size * 4 ** (check_level + 1 - level) <= CHECK_MAX_CELLS):
+                check_level += 1
+            d = check_level - level
+            expected = (kept[:, None] * np.uint64(4**d) + np.arange(4**d, dtype="uint64")).ravel()
+            covered = hpx_nested.polygon_coverage(np.asarray(rounded.exterior.coords), check_level,
+                                                  ellipsoid=HEALPIX_ELLIPSOID, flat=True)
+            covered = np.unique(np.asarray(covered[0] if isinstance(covered, tuple) else covered,
+                                           dtype="uint64"))
+            extra, missing = np.setdiff1d(covered, expected), np.setdiff1d(expected, covered)
+            if extra.size or missing.size:
+                print(f"WARNING: polygon_coverage of output_extent at level {check_level} gives "
+                      f"{extra.size} cells outside the {kept.size} kept level-{level} cells and misses "
+                      f"{missing.size} of their {expected.size} children: chunks of that level along "
+                      "the cell edges would be added or lost (use a finer align_level)")
+            if check_level < CHECK_LEVEL:
+                print(f"note: output_extent checked at level {check_level} only (level {CHECK_LEVEL} "
+                      f"would be {kept.size * 4 ** (CHECK_LEVEL - level)} cells); stage-cache checks "
+                      "the chunk counts")
+
+            # 5. the products of the pass under the region
+            under = prep(region)
+            selected = [i for i in items if i.id in chosen[0]["ids"] and under.intersects(feet[i.id])]
+            x0, y0, x1, y1 = region.bounds
+            info = {
+                "mode": "band",
+                "lat_range": [lat_min, lat_max],
+                "align_level": level,
+                "align_rule": rule,
+                "ellipsoid": HEALPIX_ELLIPSOID,
+                "indexing_scheme": HEALPIX_INDEXING,
+                "n_cells": int(kept.size),
+                "lat_min_actual": round(y0, EXTENT_DECIMALS),
+                "lat_max_actual": round(y1, EXTENT_DECIMALS),
+                "lon_min_actual": round(x0, EXTENT_DECIMALS),
+                "lon_max_actual": round(x1, EXTENT_DECIMALS),
+            }
+            print(f"band {lat_min}..{lat_max}: {kept.size} of {cells.size} level-{level} cells "
+                  f"({rule}), region lon {x0:.4f}..{x1:.4f} lat {y0:.4f}..{y1:.4f}; output_extent "
+                  f"{len(ring)} vertices, polygon_coverage at level {check_level}: {covered.size} cells; "
+                  f"{len(selected)} of {len(items)} products under the region")
+            return selected, geojson, info
+
+
         def main():
             g4e_collection = G4E_COLLECTIONS.get(collection)
             if g4e_collection is None:
                 fail(f"unsupported collection {collection!r}; known: {sorted(G4E_COLLECTIONS)}")
             limit_items = parse_int("max_items", max_items) or 1000
-            bbox_list, preset = parse_bbox(bbox)
-            region = resolve_region_name(region_name, preset)
+            lat_band, lat_preset = parse_lat_range(lat_range)
+            level = parse_align_level(align_level)
+            rule = parse_align_rule(align_rule)
+            bbox_list, bbox_preset = parse_bbox(bbox)
+            # band mode: the band names the output and bbox only picks the pass
+            region = resolve_region_name(region_name, lat_band, lat_preset, bbox_preset)
+            print(f"region tag: {region}")
             if check_sample_service.strip().lower() not in ("true", "false"):
                 fail(f"check_sample_service must be 'true' or 'false', got {check_sample_service!r}")
             client = open_client(CDSE_STAC_URL)
@@ -550,6 +1025,7 @@ spec:
                 rel_orbit = relative_orbit_of(ref)
                 t0 = parse_dt(p["datetime"])
                 dt = f"{(t0 - ORBIT_PERIOD).isoformat()}/{(t0 + ORBIT_PERIOD).isoformat()}"
+                ref_id = ref.id
                 print(f"reference: {ref.id}\n  platform={plat} absolute_orbit={abs_orbit} "
                       f"relative_orbit={rel_orbit}\n  datetime window={dt}")
             else:
@@ -559,10 +1035,15 @@ spec:
                 rel_orbit = parse_int("relative_orbit", relative_orbit)
                 abs_orbit = parse_int("absolute_orbit", absolute_orbit)
                 dt = datetime_range.strip()
+                ref_id = None
                 print(f"manual selection: platform={plat or '-'} relative_orbit={rel_orbit} "
                       f"absolute_orbit={abs_orbit} datetime={dt}")
 
-            found = search_orbit(client, plat, rel_orbit, dt, bbox_list, limit_items)
+            if lat_band:
+                print(f"band mode: lat {lat_band[0]}..{lat_band[1]}, align_level={level} ({rule}); "
+                      f"bbox {bbox_list or '-'} only picks the pass")
+            search_bbox = band_search_bbox(lat_band, level) if lat_band else bbox_list
+            found = search_orbit(client, plat, rel_orbit, dt, search_bbox, limit_items)
             if len(found) >= limit_items:
                 fail(f"the search hit max_items={limit_items}; the orbit may be incomplete, "
                      "raise max_items or narrow bbox/datetime")
@@ -594,6 +1075,15 @@ spec:
             if len(rel_orbits) != 1:
                 fail(f"expected one relative orbit, found {sorted(rel_orbits)}")
             rel_orbit = rel_orbits.pop()
+
+            if lat_band:
+                items, extent, extent_info = select_band(items, ref_id, bbox_list, lat_band, level, rule)
+                if not items:
+                    fail("no product of the orbit intersects the band region")
+                output_extent = json.dumps(extent, separators=(",", ":"))
+            else:
+                output_extent = ""
+                extent_info = {"mode": "bbox" if bbox_list else "orbit", "bbox": bbox_list}
 
             if collection.startswith("sentinel-2"):
                 tiles = Counter(i.id.split("_")[5] for i in items)
@@ -651,6 +1141,8 @@ spec:
             print("orbit:", json.dumps(orbit_info))
             print("healpix_name:", healpix_name)
             print("healpix_output_path:", healpix_output_path)
+            print("extent_info:", json.dumps(extent_info))
+            print(f"output_extent: {len(output_extent)} characters")
 
             compact = dict(separators=(",", ":"))
             write_output("items.json", json.dumps(records, **compact))
@@ -658,6 +1150,8 @@ spec:
             write_output("orbit.json", json.dumps(orbit_info, **compact))
             write_output("healpix_name.txt", healpix_name)
             write_output("healpix_output_path.txt", healpix_output_path)
+            write_output("output_extent.json", output_extent)
+            write_output("extent_info.json", json.dumps(extent_info, **compact))
 
 
         if __name__ == "__main__":
@@ -669,17 +1163,32 @@ spec:
         - name: item
         - name: s3_endpoint
         - name: eopf_image
+    # up to 5 attempts, 2, 4, 8 and 16 min apart (pod eviction, node loss, S3 or
+    # proxy errors outside the download loop); backoff.maxDuration counts from the
+    # start of the first attempt: Argo starts no retry after 2 h.
     retryStrategy:
-      limit: "2"
+      limit: "4"
       retryPolicy: Always
       # exit code 2 = no CDSE credentials: retrying cannot help
       expression: 'lastRetry.exitCode != "2"'
       backoff:
-        duration: "1m"
+        duration: "2m"
         factor: "2"
-    # per attempt (a SAFE download + eopf convert takes well under an hour); also
-    # bounds a pod stuck in ContainerCreating or ImagePullBackOff
-    activeDeadlineSeconds: 14400
+        maxDuration: "2h"
+    # Deadline of ONE attempt, sized for a pessimistic 2 MiB/s (2097152 B/s) link
+    # and a 1.3 GB SAFE (T31UDQ of orbit 4025: 1.22 GB):
+    #   3 full downloads (DOWNLOAD_ATTEMPTS; CDSE answers 416 to Range, so every
+    #   download restarts from zero): 3 x 1.3e9 B / 2 MiB/s = 3 x 620 s    = 1860 s
+    #   the 2 failed ones may first stall for the read timeout
+    #   (HTTP_TIMEOUT 600 s each) + the pauses between them (30 s + 60 s)  = 1290 s
+    #   eopf convert (~40 s measured for that S2 L2A tile; S3 budgeted)    =  900 s
+    #   upload of the ~1.2 GB store at the same 2 MiB/s                    =  620 s
+    #   total 4670 s, x 1.5 margin = 7005 s -> 7200 s (2 h = backoff.maxDuration:
+    #   an attempt that runs out of time is not retried).
+    # CDSE quota waits (429 / 503, only when another client uses the account at
+    # the same time) come out of the same budget. Also bounds a pod stuck in
+    # ContainerCreating or ImagePullBackOff.
+    activeDeadlineSeconds: 7200
     volumes:
       - name: work
         emptyDir:
@@ -723,10 +1232,11 @@ spec:
 
         A store is complete when its root zarr.json has the stac_discovery attribute;
         complete stores are skipped. Otherwise the store is built under WORK_DIR (copy
-        of the Sample Service Zarr, or CDSE SAFE download + eopf convert), whatever a
-        failed attempt left at the destination is deleted, and the store is uploaded:
-        first a placeholder root zarr.json without stac_discovery (stac-scraper skips
-        such a store), then the arrays, then the real root metadata.
+        of the Sample Service Zarr, or CDSE SAFE download + eopf convert), its STAC id
+        is set to the product name (unique, unlike the eopf id), whatever a failed
+        attempt left at the destination is deleted, and the store is uploaded: first a
+        placeholder root zarr.json without stac_discovery (stac-scraper skips such a
+        store), then the arrays, then the real root metadata.
         """
         import hashlib
         import json
@@ -774,6 +1284,11 @@ spec:
         RATE_LIMIT_MAX_WAIT = 900
         RATE_LIMIT_RETRIES = 15
         TOKEN_MAX_AGE = 300  # s, CDSE access tokens are valid for 10 min
+        HTTP_TIMEOUT = (60, 600)  # requests (connect, read) timeouts, s: slow links
+        URLLIB_TIMEOUT = 120  # s, small JSON requests (OIDC discovery, token)
+        # botocore settings of the S3 client: slow links, proxy 502 / timeouts
+        S3_CONFIG = {"connect_timeout": 120, "read_timeout": 600,
+                     "retries": {"max_attempts": 10, "mode": "adaptive"}}
         UPLOAD_WORKERS = 16
         REDIRECT_CODES = (301, 302, 303, 307, 308)
         # multihash codes -> hashlib names (CDSE uses md5, 0xd5)
@@ -808,6 +1323,7 @@ spec:
                 "key": read_secret(S3_CREDS_DIR, "accessKey"),
                 "secret": read_secret(S3_CREDS_DIR, "secretKey"),
                 "client_kwargs": {"endpoint_url": s3_endpoint},
+                "config_kwargs": dict(S3_CONFIG),
             }
             if url.startswith(PUBLIC_READ_PREFIXES):
                 options["s3_additional_kwargs"] = {"ACL": "public-read"}
@@ -867,7 +1383,8 @@ spec:
 
 
         def http_json(url, data=None):
-            with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=60) as r:
+            with urllib.request.urlopen(urllib.request.Request(url, data=data),
+                                        timeout=URLLIB_TIMEOUT) as r:
                 return json.load(r)
 
 
@@ -958,7 +1475,7 @@ spec:
                 headers = {"Authorization": f"Bearer {token}"} if auth_allowed(url) else {}
                 if requests is not None:
                     response = requests.get(url, headers=headers, stream=True,
-                                            allow_redirects=False, timeout=(60, 300))
+                                            allow_redirects=False, timeout=HTTP_TIMEOUT)
                     status = response.status_code
                     if status in REDIRECT_CODES:
                         location = response.headers.get("Location", "")
@@ -971,7 +1488,8 @@ spec:
                     return response.iter_content(BLOCK_SIZE), response.close
                 opener = urllib.request.build_opener(_NoRedirect)
                 try:
-                    response = opener.open(urllib.request.Request(url, headers=headers), timeout=300)
+                    response = opener.open(urllib.request.Request(url, headers=headers),
+                                           timeout=HTTP_TIMEOUT[1])
                 except urllib.error.HTTPError as exc:
                     if exc.code in REDIRECT_CODES:
                         location = exc.headers.get("Location", "")
@@ -1076,6 +1594,38 @@ spec:
                 raise RuntimeError(f"the root zarr.json of {local_store} has no stac_discovery")
 
 
+        def product_id(dest):
+            """STAC id of a mirrored store: its name without .zarr and without a .SEN3 /
+            .SAFE suffix (the product name), as stac-scraper --id-from-store-name."""
+            name = posixpath.basename(dest.rstrip("/"))
+            for suffix in (".zarr", ".SEN3", ".SAFE"):
+                if name.endswith(suffix):
+                    name = name[: -len(suffix)]
+            return name
+
+
+        def set_store_id(local_store, item_id):
+            """Give the root stac_discovery the unique id item_id; the eopf id goes to the
+            root attribute g4e_mirror.eopf_stac_id. (The ids eopf gives the tiles of one
+            S2 datatake differ only by a 3-hex-digit CRC: duplicates are likely.)"""
+            path = os.path.join(local_store, "zarr.json")
+            with open(path) as f:
+                metadata = json.load(f)
+            attributes = metadata["attributes"]
+            stac = attributes["stac_discovery"]
+            original = stac.get("id")
+            if original == item_id:
+                return
+            stac["id"] = item_id
+            marker = attributes.get("g4e_mirror")
+            marker = dict(marker) if isinstance(marker, dict) else {}
+            marker["eopf_stac_id"] = original
+            attributes["g4e_mirror"] = marker
+            with open(path, "w") as f:
+                json.dump(metadata, f, indent=2)
+            print(f"stac_discovery id: {original} -> {item_id}")
+
+
         def upload_store(local_store, dest):
             fs, root = get_fs(dest)
             body, last = [], {}
@@ -1142,6 +1692,7 @@ spec:
                     convert_safe(local_safe, local_zarr)
                     os.remove(local_safe)  # free the disk before the upload
                     check_local_store(local_zarr)
+                set_store_id(local_zarr, product_id(dest))
                 remove_partial(fs, root)
                 upload_store(local_zarr, dest)
                 print("done:", dest)

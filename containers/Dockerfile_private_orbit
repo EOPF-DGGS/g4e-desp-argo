@@ -7,6 +7,9 @@ FROM y74y55mn.gra7.container-registry.ovh.net/healpix-private/g4e-jupyterhub-pri
 #   because the asset and collection templates live at the repository root
 # The RUN ends with a smoke test (stac-scraper needs Python >= 3.12 for
 # itertools.batched). The token is only used on command lines, never stored.
+# pip --timeout / --retries: generous for slow or flaky links (proxy 502, timeouts).
+# bump once the half-pixel fix of extract_spatial_info_stac is merged upstream; the
+# FIX_HALF_PIXEL workaround of healpix-convert-multistage is then a no-op (see tf/README.md)
 ARG HEALPIX_CONVERT_SHA=3aa72e03be22d94e6880fdd86d9f0b4298e0ea91
 ARG LEGACY_CONVERTERS_SHA=a2b67a4f465beea5708b47328de8524f902dade6
 ARG STAC_SCRAPER_SHA=62b5c0195ce2f0e2bbe8ad3f3caeb7c5e03853b5
@@ -15,7 +18,8 @@ USER root
 RUN --mount=type=secret,id=github_token,mode=0444 \
     /srv/conda/envs/notebook/bin/pip list --format=freeze \
       | grep -v -i -E "^(legacy-converters|healpix-convert|stac-scraper)==" > /tmp/constraints.txt && \
-    /srv/conda/envs/notebook/bin/pip install --no-cache-dir -c /tmp/constraints.txt \
+    /srv/conda/envs/notebook/bin/pip install --no-cache-dir --timeout 120 --retries 10 \
+      -c /tmp/constraints.txt \
       "healpix-convert @ git+https://github.com/GRID4EARTH/healpix-convert.git@${HEALPIX_CONVERT_SHA}" \
       "legacy-converters @ git+https://$(cat /run/secrets/github_token)@github.com/GRID4EARTH/legacy-converters.git@${LEGACY_CONVERTERS_SHA}" \
       "stac-scraper[s3] @ git+https://$(cat /run/secrets/github_token)@github.com/GRID4EARTH/stac-scraper.git@${STAC_SCRAPER_SHA}" && \
