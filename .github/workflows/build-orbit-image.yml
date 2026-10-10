@@ -8,19 +8,33 @@
 #   G4E_READ_TOKEN   fine-grained PAT, Contents: read-only on
 #                    GRID4EARTH/legacy-converters and GRID4EARTH/stac-scraper
 #                    (passed to the build as the BuildKit secret github_token)
+#
+# Safety checks:
+# - `ref` must be a branch or a tag of this repository (not a pull request ref
+#   or a bare SHA): the Dockerfile that is built receives G4E_READ_TOKEN. The
+#   commit it points to is resolved once and that exact commit is built.
+# - An existing tag is not overwritten unless `overwrite` is checked. Pods use
+#   imagePullPolicy IfNotPresent, so nodes that already pulled a tag would keep
+#   the old image. Prefer a new tag, or pin the digest printed in the job
+#   summary (<image>@sha256:...).
 name: Build orbit image
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branch, tag or SHA of this repository that has containers/Dockerfile_private_orbit (use orbit-pipeline until it is merged)"
+        description: "Branch or tag of this repository that has containers/Dockerfile_private_orbit (use orbit-pipeline until it is merged)"
         required: true
         default: main
       tag:
         description: "Image tag pushed as healpix-private/g4e-jupyterhub-private:<tag>"
         required: true
         default: 2026-10-10-orbit
+      overwrite:
+        description: "Overwrite the tag if it already exists in Harbor (nodes that pulled it keep the old image)"
+        type: boolean
+        required: false
+        default: false
       healpix_convert_sha:
         description: "Optional: full healpix-convert commit SHA (empty = Dockerfile default)"
         required: false
@@ -51,47 +65,98 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
+      # Inputs reach the shell only through environment variables and are
+      # validated before use (no ${{ }} expansion inside the script). Secrets
+      # are only tested for emptiness, never printed.
+      - name: Validate inputs, secrets and ref
+        id: args
+        env:
+          REF: ${{ inputs.ref }}
+          TAG: ${{ inputs.tag }}
+          HEALPIX_CONVERT_SHA: ${{ inputs.healpix_convert_sha }}
+          LEGACY_CONVERTERS_SHA: ${{ inputs.legacy_converters_sha }}
+          STAC_SCRAPER_SHA: ${{ inputs.stac_scraper_sha }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          G4E_READ_TOKEN: ${{ secrets.G4E_READ_TOKEN }}
+        run: |
+          set -eu
+          missing=""
+          for secret in HARBOR_USERNAME HARBOR_PASSWORD G4E_READ_TOKEN; do
+            [ -n "${!secret}" ] || missing="$missing $secret"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::repository secret(s) not set:$missing (Settings -> Secrets and variables -> Actions)"; exit 1
+          fi
+          if ! printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+            echo "::error::invalid image tag: $TAG"; exit 1
+          fi
+          for name in HEALPIX_CONVERT_SHA LEGACY_CONVERTERS_SHA STAC_SCRAPER_SHA; do
+            value="${!name}"
+            if [ -n "$value" ] && ! printf '%s' "$value" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::$name must be a full 40-character commit SHA"; exit 1
+            fi
+          done
+          # ref: a branch or tag name of this repository, or refs/heads/... / refs/tags/...
+          if ! printf '%s' "$REF" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_./-]{0,254}$' \
+              || printf '%s' "$REF" | grep -Eq '\.\.|//|/$|\.lock$|\.$'; then
+            echo "::error::invalid ref: $REF"; exit 1
+          fi
+          case "$REF" in
+            refs/heads/*|refs/tags/*) candidates="$REF" ;;
+            refs/*) echo "::error::ref must be a branch or a tag of this repository, not $REF"; exit 1 ;;
+            *) candidates="refs/heads/$REF refs/tags/$REF" ;;
+          esac
+          remote_refs="$(git ls-remote --heads --tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git")"
+          sha=""
+          matched=""
+          for candidate in $candidates; do
+            # an annotated tag is listed twice; its peeled line (^{}) gives the commit
+            found="$(printf '%s\n' "$remote_refs" | awk -v r="$candidate^{}" '$2 == r { print $1 }')"
+            [ -n "$found" ] || found="$(printf '%s\n' "$remote_refs" | awk -v r="$candidate" '$2 == r { print $1 }')"
+            [ -n "$found" ] || continue
+            if [ -n "$sha" ]; then
+              echo "::error::ref $REF is both a branch and a tag; use refs/heads/$REF or refs/tags/$REF"; exit 1
+            fi
+            sha="$found"
+            matched="$candidate"
+          done
+          if [ -z "$sha" ]; then
+            echo "::error::ref $REF is not a branch or a tag of $GITHUB_REPOSITORY (pull request refs and bare SHAs are not built)"; exit 1
+          fi
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::unexpected commit id for $matched"; exit 1
+          fi
+          {
+            echo "sha=$sha"
+            echo "matched=$matched"
+            echo "build_args<<EOF_ARGS"
+            for name in HEALPIX_CONVERT_SHA LEGACY_CONVERTERS_SHA STAC_SCRAPER_SHA; do
+              value="${!name}"
+              [ -z "$value" ] || echo "$name=$value"
+            done
+            echo "EOF_ARGS"
+          } >> "$GITHUB_OUTPUT"
+          echo "source: $matched ($sha)"
+          echo "image: $IMAGE:$TAG"
+
       - name: Free disk space (the base image is large)
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
           docker system prune -af > /dev/null
           df -h /
 
+      # The exact commit resolved above, so the ref cannot move in between
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ steps.args.outputs.sha }}
           persist-credentials: false
 
-      # Inputs reach the shell only through environment variables and are
-      # validated before use (no ${{ }} expansion inside the script).
-      - name: Validate inputs and prepare build arguments
-        id: args
-        env:
-          TAG: ${{ inputs.tag }}
-          HEALPIX_CONVERT_SHA: ${{ inputs.healpix_convert_sha }}
-          LEGACY_CONVERTERS_SHA: ${{ inputs.legacy_converters_sha }}
-          STAC_SCRAPER_SHA: ${{ inputs.stac_scraper_sha }}
+      - name: Check the Dockerfile
         run: |
-          set -eu
-          if ! printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
-            echo "::error::invalid image tag: $TAG"; exit 1
-          fi
           test -f containers/Dockerfile_private_orbit || {
             echo "::error::containers/Dockerfile_private_orbit not found at this ref"; exit 1; }
-          {
-            echo "build_args<<EOF_ARGS"
-            for name in HEALPIX_CONVERT_SHA LEGACY_CONVERTERS_SHA STAC_SCRAPER_SHA; do
-              value="${!name}"
-              [ -z "$value" ] && continue
-              if ! printf '%s' "$value" | grep -Eq '^[0-9a-f]{40}$'; then
-                echo "::error::$name must be a full 40-character commit SHA" >&2; exit 1
-              fi
-              echo "$name=$value"
-            done
-            echo "EOF_ARGS"
-          } >> "$GITHUB_OUTPUT"
-          echo "image: $IMAGE:$TAG"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -102,6 +167,29 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.HARBOR_USERNAME }}
           password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Refuse to overwrite an existing tag
+        env:
+          TAG: ${{ inputs.tag }}
+          OVERWRITE: ${{ inputs.overwrite }}
+        run: |
+          set -u
+          if out="$(docker buildx imagetools inspect "$IMAGE:$TAG" 2>&1)"; then
+            if [ "$OVERWRITE" = "true" ]; then
+              echo "::warning::$IMAGE:$TAG exists and will be overwritten; nodes that already pulled it keep the old image (imagePullPolicy IfNotPresent)"
+              printf '%s\n' "$out" | grep -m1 '^Digest:' || true
+            else
+              echo "::error::$IMAGE:$TAG already exists in Harbor. Use a new tag, or check 'overwrite' (nodes that already pulled it keep the old image)."
+              printf '%s\n' "$out" | grep -m1 '^Digest:' || true
+              exit 1
+            fi
+          elif printf '%s' "$out" | grep -qi 'not found'; then
+            echo "$IMAGE:$TAG does not exist yet"
+          else
+            echo "::error::could not check whether $IMAGE:$TAG exists:"
+            printf '%s\n' "$out"
+            exit 1
+          fi
 
       - name: Build and push
         id: build
@@ -121,12 +209,16 @@ jobs:
       - name: Summary
         env:
           TAG: ${{ inputs.tag }}
-          REF: ${{ inputs.ref }}
+          MATCHED: ${{ steps.args.outputs.matched }}
+          SHA: ${{ steps.args.outputs.sha }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          echo "pushed $IMAGE:$TAG"
+          echo "digest: $IMAGE@$DIGEST"
           {
             echo "### Pushed \`$IMAGE:$TAG\`"
             echo ""
-            echo "- source ref: \`$REF\` ($(git rev-parse --short HEAD))"
+            echo "- source: \`$MATCHED\` (\`$SHA\`)"
             echo "- digest: \`$DIGEST\`"
+            echo "- pin by digest: \`$IMAGE@$DIGEST\`"
           } >> "$GITHUB_STEP_SUMMARY"
