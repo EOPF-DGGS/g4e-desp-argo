@@ -1,5 +1,7 @@
 hub:
   config:
+    GitHubOAuthenticator:
+      allow_existing_users: false
     KubeSpawner:
       start_timeout: 600
   extraConfig:
@@ -33,7 +35,7 @@ hub:
     02-profile-list: |
       async def profile_list(spawner):
           username = spawner.user.name
-          s2msi_users = ['pablo-richard', 'capetienne', 'cgueguen', 'j34ni', 'annefou', 'tinaok', 'jmdelouis']
+          s2msi_users = ['pablo-richard', 'cgueguen', 'j34ni', 'annefou', 'tinaok', 'jmdelouis']
           s3syn_users = ['j34ni', 'annefou', 'tinaok', 'tik65536']
 
           standard_profile = {

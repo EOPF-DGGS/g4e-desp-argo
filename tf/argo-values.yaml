@@ -13,11 +13,17 @@ server:
   clusterWorkflowTemplates:
     enabled: false
   serviceType: ClusterIP
-  # The argo.grid4earth.eu ingress was removed from the cluster on 2026-10-09:
-  # the server is reached in-cluster only (argo-workflows-server.argo.svc:2746,
-  # e.g. from JupyterHub). Keep it disabled so that an apply does not recreate it.
   ingress:
     enabled: false
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-jupyterhub
+    ingressClassName: nginx-jupyterhub
+    hosts:
+      - argo.grid4earth.eu
+    tls:
+      - hosts:
+          - argo.grid4earth.eu
+        secretName: argo-tls
 workflow:
   serviceAccount:
     create: true
