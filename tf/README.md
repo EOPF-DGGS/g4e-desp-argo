@@ -747,7 +747,7 @@ described in the template):
 | `check_sample_service` | `true` | copy the products from the EOPF Sample Service when it has every product of the orbit (stores from both sources cannot be merged into one HEALPix dataset) |
 | `settings_name` | `sentinel-2-l2a` | `legacy_converters` settings, named after the G4E collection: it **must match** `collection` (empty = derived from it); the run stops at the argument check otherwise |
 | `groups` | all | JSON list of groups to convert, e.g. `'["measurements/reflectance/r60m"]'` |
-| `convert_parallelism` | `48` | conversion pods (1 CPU, 4 Gi requested, 8 Gi limit) running at the same time |
+| `convert_parallelism` | `48` | conversion pods (1 CPU; 4 Gi requested / 8 Gi limit, 7 Gi / 10 Gi for the 10 m nearest groups) running at the same time |
 | `max_tasks` | `500` | upper bound on the number of conversion pods of the run |
 | `chunks_per_task` | `16` | minimum number of output chunks per conversion pod (raised per group, see below) |
 | `nworkers` | `1` | dask workers per conversion pod; the pods have 1 CPU, keep 1 |
@@ -802,59 +802,86 @@ Converting one chunk of all 16 chunked Sentinel-2 L2A groups takes 13.3 s locall
 and ~22 s with 1 (10 m reflectances: 4.85 s and 6.0 s), so four 1-CPU pods convert more than
 twice as much as one 4-CPU pod: the conversion runs on **many 1-CPU pods** (one thread each:
 `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS`,
-`RAYON_NUM_THREADS` = 1 and `torch.set_num_threads(1)`). The pods request 4 Gi with an 8 Gi
-limit, i.e. about 14 pods per b3-64 node (16 vCPU / 64 GB).
+`RAYON_NUM_THREADS` = 1 and `torch.set_num_threads(1)`). Their memory depends on the group (pod
+classes, see below): "standard" pods request 4 Gi with an 8 Gi limit (about 14 per b3-64 node of
+16 vCPU / 64 GB), "large" pods 7 Gi with a 10 Gi limit (about 8 per node).
 
-Memory: converting a chunk needs at most ~1.7 GiB (10 m `nearest` groups; 1.1 GiB for the 10 m
-reflectances, less than 0.9 GiB for the other groups) and nothing accumulates from one chunk to
-the next, but the memory allocators keep what each chunk frees: converted in a single process, a
-task of 472 chunks of a 10 m mask reached 8.2 GiB resident locally (macOS: ~0.3 GiB in use between
-chunks, at most 1.7 GiB within one, the rest freed memory kept by the allocator), above the 8 Gi
-limit. `convert-chunk` therefore converts the tasks of the 10 m and 20 m groups in sub-batches of
-about 5 minutes of work, each in a new process that gives all its memory back when it ends (the
-same 472 chunks in 5 processes: peak 6.8 GiB resident on macOS, still mostly freed memory, instead
-of 8.2 GiB); the start-up of a process (~7 s) costs 2-3 % of its work. How much glibc keeps on
-the cluster nodes has not been measured: each `convert-chunk` log ends with the peak RSS of its
-processes; lower `CHUNKS_PER_PROCESS` in the template if it comes close to 8 GiB.
+Memory: converting a chunk allocates and frees up to ~1.7 GiB (10 m `nearest` groups; 1.1 GiB for
+the 10 m reflectances, less than 0.9 GiB for the other groups) and nothing accumulates from one
+chunk to the next (Python objects, tracemalloc and the bytes in use of malloc stay flat), but the C
+allocator keeps what each chunk frees: converted in a single process, a task of 472 chunks of a
+10 m mask reached 8.0 GiB resident locally (macOS). Three measures bound it:
 
-Estimate: **~155-160 CPU-hours** on the cluster (cores assumed 1.5x slower than the benchmark
-machine; ~6 of them for the start-up of the ~1 900 processes), ~150 GB of output in a few 100 000
-to ~1 million objects. Gridlook cannot display such a strip at full resolution: the output holds
-only the data levels (20 / 19 / 17 for 10 / 20 / 60 m), so a coarse level has to be provided for
-visualisation (for example a separate coarsening step).
+- after a chunk (at most every 2 s), `convert-chunk` hands the freed memory back to the system
+  (glibc `malloc_trim(0)`, macOS `malloc_zone_pressure_relief`, ~0.05 s each);
+- the tasks of the 10 m and 20 m groups are converted in sub-batches of 2.5-5 minutes of work
+  (`CHUNKS_PER_PROCESS`: 50 chunks of a 10 m group, 80 of a 20 m reflectance, 400 of a 20 m
+  mask), each in a new process that gives all its memory back when it ends; the start-up of a
+  process (~5-7 s locally) costs 2-4 % of its work;
+- two pod classes, both 1 CPU: the three 10 m `nearest` groups (`quality/mask/r10m`,
+  `quality/atmosphere/r10m`, `conditions/mask/detector_footprint/r10m`) cannot stay under 4 GiB
+  (a fresh process reaches ~3 GiB in its first chunk: the resampler's per-chunk transient, see
+  healpix-resample#69), so they run in **large** pods (7 Gi requested, 10 Gi limit); every other
+  group runs in **standard** pods (4 Gi requested, 8 Gi limit). `stage-cache` writes the class
+  and its memory into each task (`convert-chunk` sets it with `podSpecPatch`) and gives each class
+  lanes of its own, so the memory requested by the running pods stays fixed.
 
-| Conversion pods | b3-64 nodes | Mean lane | Conversion wall time (longest lane) |
+Peak resident memory per process, measured locally (macOS, one thread, with the release above;
+the parent process of the sub-batches stays at ~15 MB):
+
+| Group(s) | Pod class | Chunks per process | Peak RSS of a process |
 |---|---|---|---|
-| 32 x 1 CPU | 3 | ~4.9 h | ~6 h |
-| **48 x 1 CPU (default)** | 4 | ~3.3 h | ~3.9 h |
-| 64 x 1 CPU | 5 | ~2.5 h | ~3.1 h |
-| 8 x 4 CPU / 16 Gi (former default) | 2-3 | | ~11 h |
+| 10 m `nearest` (masks, atmosphere, detector footprint) | large (7 / 10 Gi) | 50 | 3.9-4.2 GiB (5.0 GiB for 100 chunks; 6.3 GiB for 50 without the release) |
+| 10 m reflectances (`psf`) | standard (4 / 8 Gi) | 50 | 2.1-2.3 GiB, also at the edge of the data (3.3 GiB without the release) |
+| 20 m `nearest` (masks, probability, classification) | standard | 400 | 2.8 GiB |
+| 20 m reflectances (`psf`) | standard | 80 | ~1.2 GiB (40 chunks, without the release) |
+| 60 m and `no_chunk` groups | standard | whole task | < 1 GiB |
 
-The longest lane is ~1.2x the mean (simulated with the footprints of the 31 products): the tasks
-are sized and balanced with every chunk counted as full, but the ~21 % of chunks without data
-(east and west swath edges) cost almost nothing and gather in some tasks, since a task is a range
-of consecutive chunks. Add the mirror stage (~40-60 min) and a few minutes each for the staging
+How much glibc keeps on the cluster nodes, and how well `malloc_trim` hands it back, has not been
+measured: each `convert-chunk` log ends with the peak RSS of its processes. If one comes close to
+its limit, lower `CHUNKS_PER_PROCESS` for that group in the template, or move its key to
+`LARGE_POD_KEYS`.
+
+Estimate: **~160-165 CPU-hours** on the cluster (cores assumed 1.5x slower than the benchmark
+machine; ~8 of them for the start-up of the ~2 000 sub-batch processes), ~150 GB of output in a
+few 100 000 to ~1 million objects. Gridlook cannot display such a strip at full resolution: the
+output holds only the data levels (20 / 19 / 17 for 10 / 20 / 60 m), so a coarse level has to be
+provided for visualisation (for example a separate coarsening step).
+
+The large pods carry ~39 % of the work, so their lanes are about 40 % of `convert_parallelism`:
+
+| Conversion pods (large + standard lanes) | Memory requested | b3-64 nodes | Mean lane | Conversion wall time (longest lane) |
+|---|---|---|---|---|
+| 32 (13 + 19) | ~167 Gi | 3 | ~5.1 h | ~5.8 h |
+| **48 (19 + 29, default)** | ~249 Gi | 5 | ~3.4 h | ~3.9 h |
+| 64 (24 + 40) | ~328 Gi | 6 | ~2.5 h | ~3.3 h |
+| 8 x 4 CPU / 16 Gi (former default) | 128 Gi | 2-3 | | ~11 h |
+
+The longest lane is ~1.15x the mean with 32 or 48 pods and ~1.3x with 64 (simulated with the
+footprints of the 31 products): the tasks are sized and balanced with every chunk counted as full,
+but the ~21 % of chunks without data (east and west swath edges) cost almost nothing and gather in
+some tasks, since a task is a range of consecutive chunks. Add the mirror stage (~40-60 min) and a few minutes each for the staging
 cache, `prepare`, `finalize` and the STAC update. The `cpu-workers` and
 `dask-workers` node pools (b3-64, autoscaling 1..5 each, both untainted, so Argo pods land on both:
-at most 10 nodes) are shared with JupyterHub and Dask Gateway; `convert_parallelism=64` needs 5 of
-them.
+at most 10 nodes) are shared with JupyterHub and Dask Gateway; `convert_parallelism=48` needs about
+5 of them, `convert_parallelism=64` about 6.
 
 How the conversion is split: `stage-cache` makes at most `max_tasks` tasks. The groups cost very
 different times per chunk (one thread: 6 s for the 10 m reflectances, 3 s for a 10 m mask, 0.06 s
 for a 60 m mask), so the chunks per task are chosen per group from a benchmark table
 (`CHUNK_COST_S` in the template) for tasks of about the same time (~16 min at benchmark speed for
 the first target: 156 chunks of a 10 m reflectance group, 15 581 of a 60 m mask), at least
-`chunks_per_task`. A task of a 10 m or 20 m group is converted in sub-batches of about 5 minutes
-of work (`CHUNKS_PER_PROCESS`: 50 chunks of a 10 m reflectance, 100 of a 10 m mask), each in a new
-process (see the memory paragraph above). The tasks are then dealt into `convert_parallelism`
-lanes (Argo cannot template `parallelism`), longest first to the least loaded lane; each lane
-runs its tasks one after another. Simulated for the first target with 48 lanes, the longest lane
-is 1.07x the mean (1.17x on average and 1.37x at worst when the real cost of every group is off by
-up to 2x), against 1.49x for the former round-robin of equal batches. These figures are for the
-estimated times; with the real work (chunks without data almost free) the longest lane is ~1.2x
-the mean, as in the table above. The `stage-cache` log prints the plan and an upper estimate
-(chunks without data counted as full: 198 CPU-hours, longest lane 4.4 h, longest task 0.4 h for
-the first target with 48 lanes).
+`chunks_per_task`. A task of a 10 m or 20 m group is converted in sub-batches of 2.5-5 minutes of
+work (`CHUNKS_PER_PROCESS`: 50 chunks of a 10 m group, 80 of a 20 m reflectance, 400 of a 20 m
+mask), each in a new process (see the memory paragraph above). The tasks are then dealt into
+`convert_parallelism` lanes (Argo cannot template `parallelism`): each pod class gets lanes of its
+own (the split with the shortest longest lane: 19 large + 29 standard for 48 lanes), and within a
+class the tasks go longest first to the least loaded lane; each lane runs its tasks one after
+another. For the first target with 48 lanes the longest lane is 1.06x the mean in estimated times
+(1.49x for the former round-robin of equal batches); with the real work (chunks without data
+almost free) ~1.15x, as in the table above. The `stage-cache` log prints the plan, the lanes and
+memory per pod class, and an upper estimate (chunks without data counted as full: 200 CPU-hours,
+longest lane 4.4 h, longest task 0.4 h for the first target with 48 lanes).
 
 Bottlenecks:
 
@@ -863,13 +890,13 @@ Bottlenecks:
 - **Staging cache**: `stage-cache` (and `prepare`) are single pods that open every input store
   (cache.json ~50 KB per input, ~1.6 MB for 31 inputs; ~0.5 GiB expected for 31 inputs, 2 CPU /
   8 Gi given), and every conversion process (one per sub-batch) re-opens the 31 inputs from the
-  cache, part of its start-up (~7 s measured with one local input, of ~5 minutes of work per
+  cache, part of its start-up (~5-7 s measured with one local input, of 2.5-5 minutes of work per
   process; not measured with 31 inputs on S3, where the `set-up` time in the log shows it).
 - **S3 object count**: one object per chunk and array gives a few 100 000 to ~1 million objects
   per orbit, which slows uploads, the listing in `finalize` and any later copy or deletion. A
   future option is Zarr sharding with one shard per level-7 parent cell (256 level-11 chunks),
   which lines up with the region cells; it needs every shard to be written by a single task.
-- **Cluster size**: 48 pods take about 4 of the 10 shared nodes.
+- **Cluster size**: 48 pods (19 large, 29 standard) request ~249 Gi, about 5 of the 10 shared nodes.
 
 ### Timeouts and retries
 

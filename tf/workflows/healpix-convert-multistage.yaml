@@ -14,17 +14,19 @@
 #   convert-chunks  convert_group_to_healpix(group, chunk_indices=...) for each task,
 #                   one 1-CPU pod per task, at most `parallelism` pods at a time (the
 #                   heavy groups in sub-batches, each in a new process, see
-#                   "Conversion pods").
+#                   "Memory").
 #   finalize        checks that every chunk of each dense group was written,
 #                   consolidates the metadata, cleans the STAC item (see below) and
 #                   publishes it as the root 'stac_discovery'.
 #
 # Tasks: 'tasks' is a JSON list of {"group": "<group path>", "chunk_indices": "<JSON>",
-# "chunks_per_process": <int>, "lane": <int>}. chunk_indices is a JSON list whose
-# items are chunk indices or [start, stop) ranges; stage-cache writes one range per
-# task, e.g. "[[0,16]]". chunks_per_process is the size of the sub-batches that
-# convert-chunk converts each in a new process (0 = the whole task in one process,
-# see "Conversion pods"). There are at most max_tasks tasks (Argo cannot keep tens of
+# "chunks_per_process": <int>, "pod_class": "standard" | "large", "memory_request":
+# "<quantity>", "memory_limit": "<quantity>", "lane": <int>}. chunk_indices is a JSON
+# list whose items are chunk indices or [start, stop) ranges; stage-cache writes one
+# range per task, e.g. "[[0,16]]". chunks_per_process is the size of the sub-batches
+# that convert-chunk converts each in a new process (0 = the whole task in one
+# process); pod_class and its memory request / limit size the pod of the task (see
+# "Memory"). There are at most max_tasks tasks (Argo cannot keep tens of
 # thousands of nodes in one workflow: S2C orbit 4025 in 45..49 N has 19712 chunks in
 # each of the 16 chunked Sentinel-2 L2A groups). The groups cost very different times
 # per chunk (CHUNK_COST_S in stage-cache, one thread: 6 s for the 10 m reflectances,
@@ -103,17 +105,19 @@
 # are therefore dealt into `parallelism` lanes; each lane is a steps template with
 # parallelism 1 that runs its tasks one after another. stage-cache balances the
 # lanes on the estimated task times (longest first, each to the least loaded lane:
-# the "lane" field; lane-tasks deals round-robin when it is missing). Simulated for
-# orbit 4025, every group, 48 lanes: longest lane 1.07x the mean (1.17x on average,
-# 1.37x at worst when every group's real cost is off by up to 2x either way),
-# against 1.49x for the former round-robin of equal batches, whose 31-task group
-# blocks fall unevenly on 48 lanes (64 lanes: 1.04x / 1.18x / 1.38x against 1.31x).
-# These are estimated times, with every chunk counted as full. The chunks without
-# data (east / west swath edges, ~21 % of the extent) cost almost nothing and gather
-# in some tasks (a task is a range of consecutive chunks), so with the real work the
-# longest lane is ~1.2x the mean (simulated with the 31 footprints).
+# the "lane" field; lane-tasks deals round-robin when it is missing), each pod
+# class on lanes of its own (the large ones first), split so that the longest lane
+# is shortest: the memory requested by the running pods then stays fixed (see
+# "Memory"). For orbit 4025, every group, 48 lanes (19 large + 29 standard): longest
+# lane 1.06x the mean in estimated times (every chunk counted as full), against
+# 1.49x for the former round-robin of equal batches. The chunks without data (east /
+# west swath edges, ~21 % of the extent) cost almost nothing and gather in some
+# tasks (a task is a range of consecutive chunks), so with the real work the longest
+# lane is ~1.15x the mean with 32 or 48 lanes and ~1.3x with 64 (simulated with the
+# 31 footprints).
 #
-# Conversion pods: 1 CPU (request = limit), 4 Gi requested, 8 Gi limit, one thread
+# Conversion pods: 1 CPU (request = limit), memory per pod class (standard: 4 Gi
+# requested / 8 Gi limit, large: 7 Gi / 10 Gi, see "Memory"), one thread
 # (OMP / MKL / OPENBLAS / NUMEXPR / RAYON_NUM_THREADS = 1 and torch.set_num_threads(1)),
 # nworkers 1 (no dask cluster), parallelism 48. Threads help less than more pods: on
 # T31UDQ one chunk of all 16 chunked groups takes 13.3 s with 4 threads and ~22 s with
@@ -121,35 +125,51 @@
 # much as one 4-CPU pod. Without the thread limits torch / OpenMP / rayon start one
 # thread per node core (16) inside a 1-CPU quota and are throttled.
 #
-# Memory: converting a chunk needs at most ~1.7 GiB (10 m nearest groups; 1.1 GiB
-# for the 10 m reflectances, < 0.9 GiB for the other groups: peak physical footprint
-# measured on macOS) and nothing accumulates from chunk to chunk (Python objects,
-# tracemalloc and the bytes in use of malloc stay flat). The allocators however keep
-# the memory freed after each chunk: in ONE process, a 472-chunk task of a 10 m mask
-# reached 8.2 GiB resident (macOS: ~0.3 GiB in use between chunks, <= 1.7 GiB within
-# one, the rest freed memory kept by libmalloc), more than the 8 Gi limit; how much
-# glibc keeps on the nodes was not measured. convert-chunk therefore converts the
-# tasks of the 10 m and 20 m groups in even sub-batches of at most chunks_per_process
-# chunks (CHUNKS_PER_PROCESS in stage-cache, ~5 minutes of work: 50 chunks of a 10 m
-# reflectance, 100 of a 10 m mask, 400 of a 20 m mask), each in a new Python process
-# that gives all its memory back when it ends; the 60 m and no_chunk groups keep one
-# process per task (flat: < 1 GiB resident after 300-1000 chunks). The same 472
-# chunks in 5 processes: peak RSS 6.8 GiB (macOS, still mostly freed memory kept by
-# libmalloc) instead of 8.2 GiB. The start-up of a process (~7 s locally: imports,
-# cache, inputs, first chunks in fresh memory) costs 2-3 % of its work. Each
-# convert-chunk log ends with the peak RSS of its processes, the number to check on
-# the cluster: lower CHUNKS_PER_PROCESS if it comes close to 8 GiB.
+# Memory (measured on macOS, one thread, peak RSS of each process; the peak a pod
+# uses on the Linux nodes is printed at the end of every convert-chunk log): a chunk
+# allocates and frees up to ~1.7 GiB (10 m nearest groups; ~1.1 GiB for the 10 m
+# reflectances, < 0.9 GiB for the others) and nothing accumulates from chunk to chunk
+# (Python objects, tracemalloc and the bytes in use of malloc stay flat; gc.collect
+# finds nothing), but the C allocator keeps the freed pages, so in ONE process the
+# resident size grew with every chunk (472 chunks of a 10 m mask: 8.0 GiB). Three
+# measures bound it:
+#   - convert-chunk hands the freed memory back to the system after a chunk, at most
+#     every RELEASE_INTERVAL_S (glibc malloc_trim(0), macOS malloc_zone_pressure_relief;
+#     ~0.05 s each); measured on macOS only (not yet on glibc);
+#   - the tasks of the 10 m and 20 m groups are converted in sub-batches of
+#     chunks_per_process chunks (CHUNKS_PER_PROCESS in stage-cache: 50 chunks of a 10 m
+#     group, 80 of a 20 m reflectance, 400 of a 20 m mask; 2.5-5 minutes of work), each
+#     in a new Python process that gives all its memory back when it ends; the parent
+#     process stays at ~15 MB. The start-up of a process (~2-4 s set-up: imports, cache,
+#     inputs, plus a slower first chunk, ~5-7 s in all locally) costs 2-4 % of its
+#     work. The 60 m and no_chunk groups keep one process per task (< 1 GiB resident
+#     after 300-1000 chunks);
+#   - two pod classes (POD_CLASSES in stage-cache, field "pod_class" of the tasks, set
+#     with podSpecPatch, 1 CPU each): the 10 m nearest groups (quality/mask/r10m,
+#     quality/atmosphere/r10m, conditions/mask/detector_footprint/r10m) cannot stay
+#     under 4 GiB: a fresh process reaches ~3 GiB resident in its first chunk and,
+#     without the release, 4.5-5.5 GiB after 5-10 chunks (3.9-4.2 GiB with it; the
+#     resampler's per-chunk transient, healpix-resample#69), so they run in "large" pods, 7 Gi requested / 10 Gi limit
+#     (peak measured: 4.2 GiB per 50-chunk process with the release above, 5.0 GiB
+#     for 100 chunks; without it 6.3 GiB for 50 chunks, 6.8 GiB for 100); every other group runs in
+#     "standard" pods, 4 Gi requested / 8 Gi limit (peak measured: 10 m reflectances
+#     2.1-2.3 GiB per 25-50-chunk process with the release, also at the edge of the
+#     data, 3.3 GiB for 50 chunks without; 20 m masks
+#     2.8 GiB for 400 chunks; 20 m reflectances 1.2 GiB for 40 chunks; 60 m < 1 GiB).
+#     A b3-64 node (16 vCPU / 64 GB) holds ~8 large or ~14 standard pods.
+#   If a log shows a peak close to its limit, lower CHUNKS_PER_PROCESS for that group
+#   or move its key to LARGE_POD_KEYS.
 #
 # Scale: for orbit 4025, 45..49 N, every group (15609 of the 19712 chunks per group
-# hold data, 503 of them cross the edge of the data): ~155-160 CPU-hours on the
-# cluster (benchmark x1.5, ~6 of them for the start-up of ~1900 processes;
-# stage-cache prints 198 as an upper bound, every chunk counted as full), a mean
-# lane of ~4.9 h with 32 pods, ~3.3 h with 48 (4 b3-64 nodes of 16 vCPU / 64 GB: 14
-# pods per node by memory requests) and ~2.5 h with 64 (5 nodes); the conversion
-# takes as long as the longest lane, ~1.2x that (see above): ~6 h with 32 pods,
-# ~3.9 h with 48, ~3.1 h with 64, against ~11 h with the former 8 pods of 4 CPU /
-# 16 Gi. nworkers > 1 needs more CPUs in the convert-chunk resources (otherwise the
-# workers share one CPU).
+# hold data, 503 of them cross the edge of the data): ~160-165 CPU-hours on the
+# cluster (benchmark x1.5, ~8 of them for the start-up of ~2000 sub-batch processes;
+# stage-cache prints ~200 as an upper bound, every chunk counted as full). The tasks
+# of the large class (~39 % of the work) get lanes of their own: with 48 pods, 19
+# large lanes and 29 standard lanes, ~249 Gi requested (~5 b3-64 nodes); mean lane
+# ~3.4 h, longest ~3.9 h. With 32 pods (13 + 19 lanes, ~167 Gi, 3 nodes): ~5.1 h /
+# ~5.8 h; with 64 (24 + 40 lanes, ~328 Gi, 6 nodes): ~2.5 h / ~3.3 h; against ~11 h
+# with the former 8 pods of 4 CPU / 16 Gi. nworkers > 1 needs more CPUs in the
+# convert-chunk resources (otherwise the workers share one CPU).
 #
 # Overwrite and retries: prepare opens the output in mode "w", which deletes
 # whatever is there, so the existing-output check is done once, in stage-cache,
@@ -219,7 +239,7 @@ spec:
         description: upper bound on the number of chunk tasks (pods) in the workflow
       - name: parallelism
         value: "48"
-        description: number of chunk tasks (1-CPU pods, 4-8 Gi) running at the same time, i.e. lanes
+        description: number of chunk tasks (1-CPU pods; 4 Gi requested / 8 Gi limit, 7 Gi / 10 Gi for the 10 m nearest groups) running at the same time, i.e. lanes (split between the two pod classes)
       - name: overwrite
         value: "false"
         enum: ["true", "false"]
@@ -407,6 +427,11 @@ spec:
                 value: "{{item.chunk_indices}}"
               - name: chunks_per_process
                 value: "{{item.chunks_per_process}}"
+              # memory of the pod class of the task (see "Memory" in the header)
+              - name: memory_request
+                value: "{{item.memory_request}}"
+              - name: memory_limit
+                value: "{{item.memory_limit}}"
               - name: output_path
                 value: "{{inputs.parameters.output_path}}"
               - name: settings_name
@@ -582,12 +607,21 @@ spec:
         }
         # Chunks converted per process by convert-chunk, per (resampler, output level -
         # chunk level): a task of these groups is converted in sub-batches of that many
-        # chunks, each in a new Python process (see "Conversion pods" in the header),
-        # about 5 minutes of work each, so that the start-up of a process (~7 s measured:
-        # imports, cache, inputs, first chunks in fresh memory) costs 2-3 %. Other
+        # chunks, each in a new Python process (see "Memory" in the header), 2.5-5
+        # minutes of work each, so that the start-up of a process (~5-7 s measured:
+        # imports, cache, inputs, first chunk in fresh memory) costs 2-4 %. Other
         # groups (60 m, no_chunk) convert a whole task in one process: their memory
         # stays flat.
-        CHUNKS_PER_PROCESS = {("psf", 9): 50, ("psf", 8): 80, ("nearest", 9): 100, ("nearest", 8): 400}
+        CHUNKS_PER_PROCESS = {("psf", 9): 50, ("psf", 8): 80, ("nearest", 9): 50, ("nearest", 8): 400}
+        # Memory of the convert-chunk pods per pod class (1 CPU each, see "Memory" in the
+        # header): the 10 m nearest groups need more than the 4Gi request of the other
+        # groups (healpix-resample#69), so their tasks run in "large" pods (podSpecPatch
+        # of convert-chunk) on lanes of their own.
+        POD_CLASSES = {
+            "standard": {"memory_request": "4Gi", "memory_limit": "8Gi"},
+            "large": {"memory_request": "7Gi", "memory_limit": "10Gi"},
+        }
+        LARGE_POD_KEYS = {("nearest", 9)}  # (resampler, output level - chunk level)
         PROCESS_START_S = 10  # start-up of each further process of a task, in the estimates
         CHUNK_COST_FALLBACK = 3e-3
         CLUSTER_SLOWDOWN = 1.5  # assumed cluster core / benchmark core, for the printed estimate
@@ -983,6 +1017,11 @@ spec:
             return CHUNKS_PER_PROCESS.get(group_key(group_settings), 0)
 
 
+        def pod_class(group_settings):
+            """Pod class (key of POD_CLASSES) of the convert-chunk pods of a group."""
+            return "large" if group_key(group_settings) in LARGE_POD_KEYS else "standard"
+
+
         def task_sizes(chunk_counts, chunk_costs, minimum, limit):
             """(target seconds per task, {group: chunks per task}).
 
@@ -1033,6 +1072,46 @@ spec:
                 task["lane"] = lane
                 loads[lane] += task["estimate"]
             return ordered, loads
+
+
+        def assign_class_lanes(tasks, n_lanes):
+            """Lanes per pod class: the tasks of each class get lanes of their own (the
+            "large" ones first), so that the memory requested by the running pods stays
+            fixed (large lanes x large request + the others x standard request); the
+            split is the one with the shortest longest lane (ties: fewer large lanes),
+            each class balanced by assign_lanes. With fewer lanes than classes, the
+            classes share the lanes (each pod still gets its class's memory). Returns
+            the tasks in lane order, the estimated load of each lane and {class: lanes}."""
+            names = [c for c in POD_CLASSES if c != "standard"] + ["standard"]
+            by_class = [(c, [t for t in tasks if t["pod_class"] == c]) for c in names]
+            by_class = [(c, ts) for c, ts in by_class if ts]
+            if len(by_class) == 1 or n_lanes < len(by_class):
+                ordered, loads = assign_lanes(tasks, n_lanes)
+                counts = {c: sum(1 for i in range(n_lanes) if any(
+                    t["lane"] == i and t["pod_class"] == c for t in tasks)) for c, _ in by_class}
+                return ordered, loads, counts
+            if len(by_class) != 2:
+                fail(f"assign_class_lanes handles two pod classes, got {[c for c, _ in by_class]}")
+            (first, first_tasks), (second, second_tasks) = by_class
+            best = None
+            for n_first in range(1, n_lanes):
+                n_second = n_lanes - n_first
+                if n_first > len(first_tasks) or n_second > len(second_tasks):
+                    continue
+                longest = max(max(assign_lanes(first_tasks, n_first)[1]),
+                              max(assign_lanes(second_tasks, n_second)[1]))
+                if best is None or longest < best[0] - 1e-9:
+                    best = (longest, n_first)
+            if best is None:  # more lanes than tasks in both classes
+                n_first = min(len(first_tasks), n_lanes - 1)
+            else:
+                n_first = best[1]
+            ordered_first, loads_first = assign_lanes(first_tasks, n_first)
+            ordered_second, loads_second = assign_lanes(second_tasks, n_lanes - n_first)
+            for task in ordered_second:
+                task["lane"] += n_first
+            return (ordered_first + ordered_second, loads_first + loads_second,
+                    {first: n_first, second: n_lanes - n_first})
 
 
         def write_text(name, text):
@@ -1116,10 +1195,12 @@ spec:
             # keys are PurePath, like those of settings.group_settings
             chunk_counts, chunk_costs = {}, {}
             per_process = {}  # chunks per convert-chunk process, 0 = all in one
+            classes = {}  # pod class of the convert-chunk pods (POD_CLASSES)
             for group_path in cache.input_spatial_groups:
                 chunk_counts[group_path] = count_chunks(api, cache, settings, group_path)
                 chunk_costs[group_path] = chunk_cost(settings.group_settings[group_path])
                 per_process[group_path] = chunks_per_process(settings.group_settings[group_path])
+                classes[group_path] = pod_class(settings.group_settings[group_path])
             if extent is not None:
                 check_extent_chunks(settings, chunk_counts, extent_details)
 
@@ -1138,7 +1219,8 @@ spec:
                         extra = math.ceil((stop - start) / k) - 1 if k else 0
                         estimate = (stop - start) * cost[0] + extra * PROCESS_START_S
                     tasks.append({"group": str(group_path), "chunk_indices": chunk_indices,
-                                  "chunks_per_process": k, "estimate": estimate})
+                                  "chunks_per_process": k, "pod_class": classes[group_path],
+                                  **POD_CLASSES[classes[group_path]], "estimate": estimate})
             if not tasks:
                 fail("no output chunk to convert (does output_extent intersect the inputs?)")
             if len(tasks) > task_limit:
@@ -1150,7 +1232,7 @@ spec:
                 if task["estimate"] is None:
                     task["estimate"] = average
             n_lanes = min(max_lanes, len(tasks))
-            tasks, loads = assign_lanes(tasks, n_lanes)
+            tasks, loads, class_lanes = assign_class_lanes(tasks, n_lanes)
 
             total = sum(chunk_counts.values())
             print(f"{len(chunk_counts)} spatial group(s), {total} chunk(s), {len(tasks)} task(s), "
@@ -1165,8 +1247,17 @@ spec:
                 k = per_process[group_path]
                 if k and k < sizes[group_path]:
                     about += f", {k} chunks per process"
+                about += f", {classes[group_path]} pods"
                 print(f"  - {group_path}: {n_chunks} chunk(s) ({method}), {n_group} task(s) of up to "
                       f"{sizes[group_path]} chunk(s), {about}")
+            requested = 0.0
+            for name, count in class_lanes.items():
+                memory = POD_CLASSES[name]
+                requested += count * float(memory["memory_request"].rstrip("Gi"))
+                print(f"pod class {name}: {count} lane(s), 1 CPU, memory request "
+                      f"{memory['memory_request']} / limit {memory['memory_limit']}")
+            print(f"memory requested by the conversion pods: ~{requested:.0f} Gi in all"
+                  + (" (classes sharing lanes: at most)" if sum(class_lanes.values()) > n_lanes else ""))
             mean = sum(loads) / n_lanes
             print(f"lanes: estimated longest {max(loads) / mean:.2f}x the mean, "
                   f"{min(sum(1 for t in tasks if t['lane'] == i) for i in range(n_lanes))}-"
@@ -1649,6 +1740,8 @@ spec:
 
         TASKS_FILE = "/tmp/in/tasks.json"
         OUT_DIR = "/tmp/out"
+        # memory request / limit of the "standard" pod class (POD_CLASSES in stage-cache)
+        DEFAULT_MEMORY = ("4Gi", "8Gi")
 
 
         def main():
@@ -1657,6 +1750,10 @@ spec:
             index, count = int(lane), int(n_lanes)
             # stage-cache balances the lanes ("lane" field); round-robin without it
             mine = [t for i, t in enumerate(tasks) if t.get("lane", i % count) == index]
+            for task in mine:
+                # tasks written before the pod classes: standard convert-chunk pods
+                task.setdefault("memory_request", DEFAULT_MEMORY[0])
+                task.setdefault("memory_limit", DEFAULT_MEMORY[1])
             os.makedirs(OUT_DIR, exist_ok=True)
             with open(os.path.join(OUT_DIR, "lane_tasks.json"), "w") as f:
                 json.dump(mine, f, separators=(",", ":"))
@@ -1689,9 +1786,18 @@ spec:
         - name: nworkers
         - name: s3_endpoint
         - name: healpix_image
+        # memory of the pod class of the task (POD_CLASSES in stage-cache, see "Memory"
+        # in the header); the defaults are the "standard" class
+        - name: memory_request
+          value: 4Gi
+        - name: memory_limit
+          value: 8Gi
       artifacts:
         - name: cache
           path: /tmp/in/cache.json
+    # Argo cannot template the resources field itself: the memory of the pod class
+    # is set by patching the pod spec (the CPU stays as below)
+    podSpecPatch: '{"containers": [{"name": "main", "resources": {"requests": {"memory": "{{inputs.parameters.memory_request}}"}, "limits": {"memory": "{{inputs.parameters.memory_limit}}"}}}]}'
     volumes:
       - name: s3-creds
         secret:
@@ -1720,10 +1826,10 @@ spec:
         - name: RAYON_NUM_THREADS
           value: "1"
       # 1 CPU: four 1-thread pods convert more than twice as much as one 4-thread pod
-      # (see "Conversion pods" in the header). Memory: a chunk needs at most ~1.7 GiB
-      # (10 m nearest groups); the sub-batches in new processes (chunks_per_process)
-      # keep the memory the allocators hold after each chunk from piling up over a
-      # task. 4 Gi requested (14 pods per b3-64 node), 8 Gi limit as headroom.
+      # (see "Conversion pods" in the header). Memory (see "Memory" in the header):
+      # the "standard" pod class, 4 Gi requested (14 pods per b3-64 node), 8 Gi limit;
+      # podSpecPatch above sets 7 Gi / 10 Gi for the "large" class (the 10 m nearest
+      # groups, healpix-resample#69).
       resources:
         requests:
           cpu: "1"
@@ -1770,6 +1876,11 @@ spec:
         EXIT_INVALID = 2  # not retried by the retryStrategy
         # message of the deterministic resampler error (healpix_resample KNeighborsResampler)
         RESAMPLER_NO_CELL = "No HEALPix cell passed the threshold"
+        # the free memory the C allocator keeps is handed back to the system after a chunk
+        # when at least this long has passed since the previous time (after every chunk
+        # of the 10 m groups, every 2-4 chunks of the 20 m groups; ~0.05 s each, ~1-2 %
+        # of the work), see release_memory_after_chunks()
+        RELEASE_INTERVAL_S = 2.0
 
 
         def fail(message, code=EXIT_INVALID):
@@ -2018,10 +2129,64 @@ spec:
                 classes[name] = make
 
 
+        def allocator_release():
+            """A function that hands the free memory kept by the C allocator back to the
+            system: glibc malloc_trim(0) (also the free pages inside the heap), macOS
+            malloc_zone_pressure_relief(NULL, 0); None elsewhere (e.g. musl)."""
+            import ctypes
+
+            try:
+                if sys.platform.startswith("linux"):
+                    trim = ctypes.CDLL("libc.so.6").malloc_trim
+                    trim.argtypes = [ctypes.c_size_t]
+                    trim.restype = ctypes.c_int
+                    return lambda: trim(0)
+                if sys.platform == "darwin":
+                    relief = ctypes.CDLL("/usr/lib/libSystem.B.dylib").malloc_zone_pressure_relief
+                    relief.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                    relief.restype = ctypes.c_size_t
+                    return lambda: relief(None, 0)
+            except (OSError, AttributeError):
+                pass
+            return None
+
+
+        def release_memory_after_chunks(module_name):
+            """After a chunk (at most once per RELEASE_INTERVAL_S), hand the memory the C
+            allocator keeps after free() back to the system. Converting a chunk allocates
+            and frees up to ~1.7 GiB (10 m nearest groups); the Python objects and the
+            bytes in use stay flat from chunk to chunk (gc.collect finds nothing), but the
+            allocator keeps the freed pages, so the resident size of a process grew with
+            every chunk (see "Memory" in the header)."""
+            release = allocator_release()
+            if release is None:
+                print("no allocator release function on this platform", flush=True)
+                return
+            module = importlib.import_module(module_name)
+            last = [time.monotonic()]
+            for name in ("DenseChunkConverter", "SparseChunkConverter"):
+                cls = getattr(module, name, None)
+                original = getattr(cls, "convert", None)
+                if original is None or getattr(original, "g4e_patched", False):
+                    continue
+
+                def convert(self, chunk_index=None, _original=original):
+                    try:
+                        return _original(self, chunk_index)
+                    finally:
+                        if time.monotonic() - last[0] >= RELEASE_INTERVAL_S:
+                            release()
+                            last[0] = time.monotonic()
+
+                convert.g4e_patched = True
+                cls.convert = convert
+
+
         def patch_converter(module_name):
             fix_half_pixel()
             skip_empty_chunks(module_name)
             float64_resampler_coordinates(module_name)
+            release_memory_after_chunks(module_name)
 
 
         def patch_converter_on_workers(client, module_name):
@@ -2159,7 +2324,7 @@ spec:
             """Convert the chunks in even sub-batches of at most `size` chunks, one after
             another, each in a new Python process (this script run again with
             SUB_BATCH_FLAG), so that the memory kept by the allocators after each chunk
-            (see "Conversion pods" in the header) is given back to the system after every
+            (see "Memory" in the header) is given back to the system after every
             sub-batch instead of piling up over the whole task. A failed sub-batch fails
             the task with its exit code (2 is not retried; a process killed by signal N,
             e.g. at the memory limit, gives 128 + N), after its own output and traceback;
