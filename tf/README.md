@@ -241,7 +241,7 @@ OVHcloud project: GRID4EARTH (24b43ff90f3044c8923063b0fbb53f26)
 │   ├── JupyterHub 4.3.2     — https://jupyterhub.grid4earth.eu
 │   │   ├── Profile: Standard CPU (✅ operational) — up to 32 GB RAM
 │   │   ├── Profile: Sentinel-2 MSI (✅ operational) — up to 64 GB RAM
-│   │   │   allowed users: pablo-richard, capetienne, cgueguen, j34ni, annefou
+│   │   │   allowed users: pablo-richard, cgueguen, j34ni, annefou
 │   │   ├── Profile: Sentinel-3 SYNERGY / s3syn (✅ operational) — up to 32 GB RAM
 │   │   │   allowed users: j34ni, annefou, tik65536, tinaok
 │   │   │   image: y74y55mn.gra7.container-registry.ovh.net/healpix-private/s3syn:latest
@@ -253,8 +253,8 @@ OVHcloud project: GRID4EARTH (24b43ff90f3044c8923063b0fbb53f26)
 │   └── cert-manager — Let's Encrypt TLS
 │
 ├── Namespace: argo
-│   └── Argo Workflows 0.46.2 — https://argo.grid4earth.eu
-│       └── Artifacts → S3 bucket (TBD — see Argo artifacts section)
+│   └── Argo Workflows 0.46.2 (internal only: http://argo-workflows-server.argo.svc.cluster.local:2746)
+│       └── Artifacts → S3 bucket g4e-desp-argo-artifacts
 │
 ├── Namespace: stac
 │   ├── stac-fastapi-geoparquet — https://stac-api.grid4earth.eu
@@ -275,7 +275,7 @@ OVHcloud project: GRID4EARTH (24b43ff90f3044c8923063b0fbb53f26)
 └── S3 buckets (GRA)
     ├── g4e-desp-state          (Tofu state)
     ├── grid4earth              (public data via data.grid4earth.eu)
-    └── <TBD>                   (Argo Workflows artifacts)
+    └── g4e-desp-argo-artifacts (Argo Workflows artifacts)
 ```
 
 ---
@@ -419,24 +419,18 @@ When GPU nodes are provisioned:
 
 ---
 
-## Argo Workflows artifacts
+## Argo Workflows
 
-Argo is configured to store artifacts and logs in an S3 bucket. The bucket name is defined in
-`argo-values.yaml`. Once the bucket name is confirmed, create it:
+The Argo server runs in `server` auth mode and is only reachable from inside the cluster,
+e.g. from a JupyterHub notebook or terminal:
 
-```bash
-AWS_ACCESS_KEY_ID="<s3_access_key>" \
-AWS_SECRET_ACCESS_KEY="<s3_secret_key>" \
-aws s3 mb s3://<bucket-name> \
-  --endpoint-url https://s3.gra.io.cloud.ovh.net \
-  --region gra
-```
+    http://argo-workflows-server.argo.svc.cluster.local:2746
 
-Then update `argo-values.yaml` accordingly and redeploy:
+The public ingress (`argo.grid4earth.eu`) is disabled in `argo-values.yaml` until
+authentication is set up.
 
-```bash
-tofu apply -var-file=secrets/terraform.tfvars -target=helm_release.argo_workflows
-```
+Artifacts and logs are stored in the S3 bucket `g4e-desp-argo-artifacts`, configured in
+`argo-values.yaml` with the `argo-s3-credentials` secret.
 
 ---
 
