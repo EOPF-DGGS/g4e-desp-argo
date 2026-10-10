@@ -390,7 +390,7 @@ spec:
           * optionally find each product on the EOPF Sample Service (one search over
             the whole orbit): same id first, else same sensing (S2: id without the
             processing time; S3: sensing start/stop, timeliness and baseline) within
-            +-5 min, latest processing first. The Sample Service is used only when it
+            +-5 min, one product each and the same footprint. The Sample Service is used only when it
             has every product of the orbit.
         """
         import json
@@ -429,6 +429,9 @@ spec:
         EOPF_STAC_URL = "https://stac.core.eopf.eodc.eu"
         ORBIT_PERIOD = timedelta(minutes=101)  # S2 ~100.6 min, S3 ~101 min
         SAMPLE_SERVICE_WINDOW = timedelta(minutes=5)
+        # a Sample Service product replaces a CDSE product of the same sensing (not the
+        # same id) only when their footprints overlap this much (intersection / union)
+        MATCH_MIN_IOU = 0.95
         EXIT_INVALID = 2  # deterministic error, not retried by the retryStrategy
         # named regions accepted by bbox; a bbox equal to a preset names the output
         # after it (as legacy-datasets download_orbit.py --bbox france)
@@ -766,10 +769,22 @@ spec:
             One search over the orbit (time span +-5 min, union of the item bboxes)
             instead of one get_item + one search per item; then, per item, the same
             rules as legacy-datasets download_orbit_after_checking_sample_service.py:
-            same id first, else the same match_key with a datetime within +-5 min,
-            latest processing first. A key shared by two CDSE products (S2 tile split
-            at a datatake boundary) is ambiguous: no key match for those.
+            same id first, else the same match_key with a datetime within +-5 min, but
+            only when the key is unambiguous on BOTH sides (one CDSE and one Sample
+            Service product: S2 tiles split at a datatake boundary come as partial
+            products that differ only in processing time) and the footprints are the same
+            area (intersection / union >= MATCH_MIN_IOU).
             """
+            from shapely.geometry import shape
+
+            def same_footprint(item, cand):
+                if not item.geometry or not cand.geometry:
+                    return False
+                a, b = (g if g.is_valid else g.buffer(0)
+                        for g in (shape(item.geometry), shape(cand.geometry)))
+                union = a.union(b).area
+                return union > 0 and a.intersection(b).area / union >= MATCH_MIN_IOU
+
             times = [parse_dt(i.properties["datetime"]) for i in items]
             dt = (f"{(min(times) - SAMPLE_SERVICE_WINDOW).isoformat()}/"
                   f"{(max(times) + SAMPLE_SERVICE_WINDOW).isoformat()}")
@@ -788,19 +803,23 @@ spec:
 
             by_id = {c.id: c for c in candidates}
             by_key = {}
-            for cand in sorted(candidates, key=lambda c: (processing_time(c.id), c.id)):
-                by_key[match_key(cand.id)] = cand  # latest processing wins
+            for cand in candidates:
+                by_key.setdefault(match_key(cand.id), []).append(cand)
             keys = Counter(match_key(i.id) for i in items)
             hrefs = {}
             for item in items:
                 match = by_id.get(item.id)
                 key = match_key(item.id)
                 if match is None and keys[key] == 1:
-                    cand = by_key.get(key)
+                    found = by_key.get(key, [])
                     t0 = parse_dt(item.properties["datetime"])
-                    if (cand is not None and cand.datetime is not None
-                            and abs(cand.datetime - t0) <= SAMPLE_SERVICE_WINDOW):
-                        match = cand
+                    if (len(found) == 1 and found[0].datetime is not None
+                            and abs(found[0].datetime - t0) <= SAMPLE_SERVICE_WINDOW
+                            and same_footprint(item, found[0])):
+                        match = found[0]
+                    elif found:
+                        print(f"note: {item.id}: {len(found)} Sample Service product(s) with the same "
+                              "sensing, none unambiguous with the same footprint: from CDSE")
                 if match is not None:
                     hrefs[item.id] = match.assets["product"].href
             return hrefs
@@ -888,6 +907,7 @@ spec:
             items: the products of ONE absolute orbit found in band_search_bbox.
             """
             import numpy as np
+            from shapely.affinity import translate
             from shapely.geometry import Polygon, box
             from shapely.geometry.polygon import orient
             from shapely.ops import unary_union
@@ -972,11 +992,23 @@ spec:
             cells = np.unique(np.asarray(cover[0] if isinstance(cover, tuple) else cover, dtype="uint64"))
             polygons, vertex_lats = cell_polygons(cells, level, hpx_nested, VERTEX_STEP)
             test = prep(swath)
-            keep = np.array([
-                (rule == "intersects" or (lats.min() >= lat_min - 1e-9 and lats.max() <= lat_max + 1e-9))
-                and test.intersects(poly)
-                for poly, lats in zip(polygons, vertex_lats)
-            ], dtype=bool)
+
+            def rule_ok(lats):
+                return rule == "intersects" or (lats.min() >= lat_min - 1e-9 and lats.max() <= lat_max + 1e-9)
+
+            # cell_polygons draws a cell across the antimeridian on the +180 side, where a
+            # swath west of it (negative longitudes) does not meet it: test such a cell on
+            # both sides, and stop when the swath needs it (the region must be ONE polygon
+            # in lon -180..180, which cannot hold it), instead of dropping it silently
+            across = [int(cell) for cell, poly, lats in zip(cells, polygons, vertex_lats)
+                      if poly.bounds[2] > 180.0 and rule_ok(lats)
+                      and (test.intersects(poly) or test.intersects(translate(poly, xoff=-360.0)))]
+            if across:
+                fail(f"{len(across)} level-{level} cells needed by the swath cross the antimeridian "
+                     f"({', '.join(map(str, across[:8]))}{', ...' if len(across) > 8 else ''}): not "
+                     "supported (healpix-convert needs one polygon in lon -180..180)")
+            keep = np.array([rule_ok(lats) and test.intersects(poly)
+                             for poly, lats in zip(polygons, vertex_lats)], dtype=bool)
             if not keep.any():
                 fail(f"no level-{level} cell kept with align_rule={rule} (band too narrow for "
                      "'within'? lower align_level or use 'intersects')")
@@ -1775,15 +1807,26 @@ spec:
             if _token["value"] and time.monotonic() - _token["time"] < TOKEN_MAX_AGE:
                 return _token["value"]
             token_url = http_json(OIDC_DISCOVERY_URL)["token_endpoint"]
+            # the password only goes to https *.dataspace.copernicus.eu, and a redirect
+            # is not followed (exit 2, not retried)
+            if not auth_allowed(token_url):
+                fail(f"the CDSE token endpoint {redact(token_url)} is not https *.{AUTH_DOMAIN}: "
+                     "the credentials are not sent")
             form = urllib.parse.urlencode({
                 "grant_type": "password",
                 "client_id": CDSE_CLIENT_ID,
                 "username": read_secret(CDSE_CREDS_DIR, "username"),
                 "password": read_secret(CDSE_CREDS_DIR, "password"),
             }).encode()
+            opener = urllib.request.build_opener(_NoRedirect)
             try:
-                value = http_json(token_url, form)["access_token"]
+                with opener.open(urllib.request.Request(token_url, data=form),
+                                 timeout=URLLIB_TIMEOUT) as response:
+                    value = json.load(response)["access_token"]
             except urllib.error.HTTPError as exc:
+                if exc.code in REDIRECT_CODES:
+                    fail(f"the CDSE token endpoint answered HTTP {exc.code} (redirect to "
+                         f"{redact(exc.headers.get('Location', ''))}): the credentials are not sent again")
                 raise RuntimeError(f"CDSE token request failed: HTTP {exc.code}") from None
             _token.update(value=value, time=time.monotonic())
             return value
@@ -1798,10 +1841,25 @@ spec:
 
 
         def retry_after(headers):
-            try:
-                return min(max(int(headers.get("Retry-After", "")), 1), RATE_LIMIT_MAX_WAIT)
-            except (AttributeError, TypeError, ValueError):
+            """Seconds to wait from Retry-After, as delay-seconds or as an HTTP-date (RFC 9110
+            10.2.3); RATE_LIMIT_WAIT when absent or unreadable. Not capped: a wait above
+            RATE_LIMIT_MAX_WAIT stops the product (download)."""
+            import email.utils
+            import math
+            from datetime import datetime, timezone
+
+            value = (headers.get("Retry-After") or "").strip()
+            if not value:
                 return RATE_LIMIT_WAIT
+            if value.isdigit():
+                return max(int(value), 1)
+            try:
+                when = email.utils.parsedate_to_datetime(value)
+            except (TypeError, ValueError, IndexError):
+                return RATE_LIMIT_WAIT
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return max(math.ceil((when - datetime.now(timezone.utc)).total_seconds()), 1)
 
 
         def expected_digest(checksum):
@@ -1918,6 +1976,11 @@ spec:
                           f"{f', {algo} ok' if hasher else ''}")
                     return
                 except RateLimited as exc:
+                    if exc.wait > RATE_LIMIT_MAX_WAIT:
+                        # retrying earlier than asked only uses up the quota: stop (exit 2,
+                        # not retried by Argo); run the workflow again later
+                        fail(f"{exc}: CDSE asks to wait {exc.wait} s (Retry-After), more than "
+                             f"{RATE_LIMIT_MAX_WAIT} s; submit again later")
                     waits += 1
                     if waits > RATE_LIMIT_RETRIES:
                         raise RuntimeError(f"{exc}: still rate-limited after {RATE_LIMIT_RETRIES} waits") from None

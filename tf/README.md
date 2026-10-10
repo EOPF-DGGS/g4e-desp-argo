@@ -657,7 +657,10 @@ Recommendations:
 - A CDSE account allows 4 concurrent connections. The mirror step runs at most 4 pods at a time
   for that reason; do not download with the same account elsewhere (for example
   `legacy-datasets` `download_orbit.py`) while a pipeline runs. HTTP 429 / 503 answers are waited
-  out (`Retry-After`) and the access token is reused for a few minutes.
+  out (`Retry-After`, in seconds or as an HTTP date; more than 15 minutes stops the product with
+  exit code 2, not retried) and the access token is reused for a few minutes. The username and
+  password are only posted to an https `*.dataspace.copernicus.eu` token endpoint, and a redirect
+  of that request is refused (exit code 2).
 
 ### Artifacts
 
